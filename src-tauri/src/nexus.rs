@@ -138,6 +138,20 @@ pub struct Downloaded {
     pub link: NexusLink,
 }
 
+impl Downloaded {
+    /// Removes the file and the folder made for it.
+    pub fn discard(&self) {
+        match self.path.parent() {
+            Some(dir) if dir.file_name().is_some_and(|n| n != "downloads") => {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            _ => {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+    }
+}
+
 pub const CANCELLED: &str = "Download cancelled.";
 
 /// Downloads the file an nxm:// link points at. Works for free accounts.
@@ -180,10 +194,14 @@ pub fn download_file(
     }
     let total = response.content_length();
     let name = sanitize_folder(&info.file_name);
-    let dir = data_dir.join("downloads");
+    // Each download gets its own folder, so queued files with the same name can't collide.
+    let dir = data_dir.join("downloads").join(uuid::Uuid::new_v4().to_string());
     std::fs::create_dir_all(&dir).map_err(|e| io_msg("Could not create folder", e))?;
     let path = dir.join(&name);
-    save_stream(&mut response, total, &path, &|got| progress(&format!("Downloading {name}"), total.map(|t| got as f64 / t as f64)), cancel)?;
+    if let Err(e) = save_stream(&mut response, total, &path, &|got| progress(&format!("Downloading {name}"), total.map(|t| got as f64 / t as f64)), cancel) {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(e);
+    }
     Ok(Downloaded {
         path,
         link: NexusLink { mod_id, file_id: Some(file_id), version: info.version.or(info.mod_version), latest: None, title: info.name },
@@ -246,7 +264,7 @@ const GRAPHQL_URL: &str = "https://api.nexusmods.com/v2/graphql";
 const GAME_ID: &str = "1059";
 const THUMBNAIL_HOST: &str = "https://staticdelivery.nexusmods.com/";
 
-#[derive(Serialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct NexusMod {
     pub id: u64,
     pub name: String,
@@ -388,6 +406,35 @@ pub fn parse_files(data: &Value) -> Vec<NexusFile> {
         .unwrap_or_default();
     files.sort_by_key(|f| (rank(&f.category), std::cmp::Reverse(f.date), std::cmp::Reverse(f.id)));
     files
+}
+
+/// A mod from the page, cleaned before it's saved: it came through the interface, so it isn't trusted.
+pub fn clean_viewed(mut m: NexusMod) -> Option<NexusMod> {
+    if m.id == 0 {
+        return None;
+    }
+    let cap = |s: &mut String, n: usize| *s = s.chars().take(n).collect();
+    cap(&mut m.name, 200);
+    cap(&mut m.summary, 600);
+    cap(&mut m.version, 60);
+    cap(&mut m.author, 120);
+    cap(&mut m.updated, 40);
+    m.picture = m.picture.filter(|p| p.starts_with(THUMBNAIL_HOST) && p.len() < 400);
+    Some(m)
+}
+
+/// Puts a viewed mod first, without duplicates, keeping at most `max`.
+pub fn push_recent(list: &mut Vec<RecentMod>, m: NexusMod, now: i64, max: usize) {
+    list.retain(|r| r.m.id != m.id);
+    list.insert(0, RecentMod { m, viewed: now });
+    list.truncate(max);
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct RecentMod {
+    #[serde(flatten)]
+    pub m: NexusMod,
+    pub viewed: i64,
 }
 
 pub fn files(mod_id: u64) -> R<Vec<NexusFile>> {
@@ -552,6 +599,42 @@ mod tests {
         let files = parse_files(&data);
         assert_eq!(files.iter().map(|f| f.id).collect::<Vec<_>>(), vec![901, 900]);
         assert_eq!(files[0].size, 5000);
+    }
+
+    fn sample(id: u64) -> NexusMod {
+        NexusMod {
+            id,
+            name: format!("Mod {id}"),
+            summary: String::new(),
+            version: "1".into(),
+            author: "A".into(),
+            downloads: 1,
+            endorsements: 1,
+            picture: Some(format!("{THUMBNAIL_HOST}mods/1059/images/{id}.jpg")),
+            updated: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn recent_list_moves_repeats_to_front_and_caps() {
+        let mut list = Vec::new();
+        for id in 1..=5 {
+            push_recent(&mut list, sample(id), id as i64, 3);
+        }
+        push_recent(&mut list, sample(4), 99, 3);
+        assert_eq!(list.iter().map(|r| r.m.id).collect::<Vec<_>>(), vec![4, 5, 3]);
+        assert_eq!(list[0].viewed, 99);
+    }
+
+    #[test]
+    fn viewed_mods_are_cleaned_before_saving() {
+        let mut m = sample(7);
+        m.picture = Some("https://evil.example/x.png".into());
+        m.name = "x".repeat(1000);
+        let clean = clean_viewed(m).unwrap();
+        assert_eq!(clean.picture, None);
+        assert_eq!(clean.name.len(), 200);
+        assert!(clean_viewed(sample(0)).is_none());
     }
 
     #[test]

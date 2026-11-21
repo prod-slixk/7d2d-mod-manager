@@ -25,6 +25,8 @@ pub struct Candidate {
     pub existing_version: Option<String>,
     pub origin: String,
     pub nexus_id: Option<u64>,
+    /// Full Nexus details when the file came from a Nexus download.
+    pub nexus: Option<NexusLink>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -39,7 +41,6 @@ pub struct Staging {
     pub dir: PathBuf,
     pub candidates: Vec<Candidate>,
     pub errors: Vec<String>,
-    pub nexus: Option<NexusLink>,
     pub import: Option<Manifest>,
 }
 
@@ -89,6 +90,7 @@ pub fn candidate_from(dir: &Path, unpack_root: &Path, origin: &str, stem: &str, 
         has_dll,
         origin: origin.to_string(),
         nexus_id,
+        nexus: None,
     }
 }
 
@@ -107,11 +109,17 @@ pub fn dedupe(candidates: &mut [Candidate]) {
 }
 
 pub fn prepare(app: &App, existing: &[ModEntry], paths: &[String], nexus: Option<NexusLink>, progress: &dyn Fn(&str)) -> R<Staging> {
+    let sources: Vec<(String, Option<NexusLink>)> = paths.iter().map(|p| (p.clone(), nexus.clone())).collect();
+    prepare_sources(app, existing, &sources, progress)
+}
+
+/// Stages several archives or folders at once, each with its own Nexus details if any.
+pub fn prepare_sources(app: &App, existing: &[ModEntry], sources: &[(String, Option<NexusLink>)], progress: &dyn Fn(&str)) -> R<Staging> {
     let id = uuid::Uuid::new_v4().to_string();
     let dir = app.dir.join("staging").join(&id);
     let (mut candidates, mut errors) = (Vec::new(), Vec::new());
 
-    for (i, raw) in paths.iter().enumerate() {
+    for (i, (raw, nexus)) in sources.iter().enumerate() {
         let path = Path::new(raw);
         let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
         let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
@@ -136,6 +144,7 @@ pub fn prepare(app: &App, existing: &[ModEntry], paths: &[String], nexus: Option
             // A folder dropped directly is its own root, but already has a good name.
             let root = if path.is_dir() && m == out { PathBuf::new() } else { out.clone() };
             let mut c = candidate_from(&m, &root, &name, &stem, existing, nexus_id);
+            c.nexus = nexus.clone();
             if path.is_dir() && m == out {
                 c.folder = sanitize_folder(&name);
                 let old = existing.iter().find(|e| e.folder.eq_ignore_ascii_case(&c.folder));
@@ -150,7 +159,7 @@ pub fn prepare(app: &App, existing: &[ModEntry], paths: &[String], nexus: Option
         let _ = fs::remove_dir_all(&dir);
         return Err(if errors.is_empty() { "Nothing to install.".to_string() } else { errors.join("\n") });
     }
-    Ok(Staging { id, dir, candidates, errors, nexus, import: None })
+    Ok(Staging { id, dir, candidates, errors, import: None })
 }
 
 #[derive(Serialize, Debug, Default)]
@@ -185,7 +194,7 @@ pub fn commit(app: &App, inst: &Instance, staging: &Staging, selected: &[String]
             Ok(()) => {
                 result.installed.push(c.title.clone());
                 if let Some(mod_id) = c.nexus_id {
-                    let from_nexus = staging.nexus.clone().filter(|n| n.mod_id == mod_id);
+                    let from_nexus = c.nexus.clone().filter(|n| n.mod_id == mod_id);
                     let link = NexusLink {
                         mod_id,
                         file_id: from_nexus.as_ref().and_then(|n| n.file_id),

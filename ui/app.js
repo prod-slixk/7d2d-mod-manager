@@ -433,6 +433,7 @@ function renderNav() {
   navEl.replaceChildren(...NAV.map(([id, label, ic]) => {
     let count = null;
     if (id === "mods") count = h("span", { class: "count" }, S.mods.filter((m) => m.enabled && !m.core && !m.problem).length);
+    if (id === "browse" && queueOpen()) count = h("span", { class: "count medium", title: "Files in the install queue" }, queueOpen());
     if (id === "conflicts" && high + medium) count = h("span", { class: `count ${high ? "high" : "medium"}` }, high + medium);
     return h("button", { class: S.view === id ? "on" : "", "aria-current": S.view === id ? "page" : null, onclick: () => go(id) }, icon(ic, 18), label, count);
   }));
@@ -768,18 +769,21 @@ async function reviewInstall(staged) {
   });
   if (!result) {
     await invoke("cancel_install", { staging: staged.id });
-    return;
+    return null;
   }
+  let outcome = null;
   try {
     const r = await withBusy("Installing", () => call("commit_install", { staging: staged.id, selected: result }));
     if (r.installed.length) toast(`Installed ${r.installed.join(", ")}`);
     if (r.profile) toast(`Created profile ${r.profile}`);
     r.failed.forEach((x) => toast(x, "error"));
     if (r.missing.length) await showMissing(r.missing);
+    outcome = { result: r, chosen: staged.candidates.filter((c) => result.includes(c.id)) };
   } catch (e) {
     fail(e);
   }
   await afterChange();
+  return outcome;
 }
 
 function showMissing(missing) {
@@ -800,16 +804,28 @@ async function handleNxm() {
   if (nxmBusy) return;
   nxmBusy = true;
   try {
-    for (const url of await invoke("take_pending_nxm")) {
-      if (!instId()) {
-        toast("Add a game folder before downloading from Nexus.", "warn");
-        continue;
-      }
-      try {
-        const staged = await withBusy("Contacting Nexus", () => call("nexus_download", { url }), { cancel: true });
-        await reviewInstall(staged);
-      } catch (e) {
-        downloadFail(e);
+    // Links can keep arriving while one is handled, so drain until none are left.
+    for (let urls = await invoke("take_pending_nxm"); urls.length; urls = await invoke("take_pending_nxm")) {
+      for (const url of urls) {
+        if (!instId()) {
+          toast("Add a game folder before downloading from Nexus.", "warn");
+          continue;
+        }
+        // A link for a queued file feeds the queue instead of opening its own review.
+        const ids = /^nxm:\/\/7daystodie\/mods\/(\d+)\/files\/(\d+)/i.exec(url);
+        const queued = ids && B.queue.find((q) => q.key === queueKey(Number(ids[1]), Number(ids[2])) && ["queued", "waiting", "failed"].includes(q.status));
+        if (queued) {
+          await fetchQueued(queued, url);
+          if (B.running) await advanceQueue();
+          else if (queued.status === "ready") toast(`${queued.mod.name} downloaded. Press Install all in the queue when you're ready.`);
+          continue;
+        }
+        try {
+          const staged = await withBusy("Contacting Nexus", () => call("nexus_download", { url }), { cancel: true });
+          await reviewInstall(staged);
+        } catch (e) {
+          downloadFail(e);
+        }
       }
     }
   } finally {
@@ -820,43 +836,79 @@ async function handleNxm() {
 // ---- browse Nexus ----------------------------------------------------------
 
 const SORTS = [["endorsements", "Most endorsed"], ["downloads", "Most downloaded"], ["updated", "Recently updated"], ["newest", "Newest"]];
-const B = { query: "", sort: "endorsements", mods: [], total: 0, loading: false, error: null, selected: null, files: {}, token: 0, timer: null };
-let browseGrid, browseDetail, browseCount;
+const B = {
+  tab: "search", query: "", sort: "endorsements", mods: [], total: 0, loading: false, error: null, selected: null, files: {}, token: 0, timer: null,
+  recent: [], recentLoaded: false,
+  queue: [], running: false,
+};
+let browseGrid, browseDetail, browseCount, queueTabBtn;
 
 const fmtCount = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}K` : String(n));
 const fmtDay = (iso) => (iso ? new Date(iso).toLocaleDateString([], { dateStyle: "medium" }) : "");
 const installedFrom = (id) => S.mods.find((m) => m.nexus?.mod_id === id);
 const nexusFileUrl = (modId, fileId) => `https://www.nexusmods.com/7daystodie/mods/${modId}?tab=files&file_id=${fileId}&nmm=1`;
+const queueKey = (modId, fileId) => `${modId}:${fileId}`;
+const queueOpen = () => B.queue.filter((q) => q.status !== "installed").length;
+const queueLabel = () => `Queue${queueOpen() ? ` (${queueOpen()})` : ""}`;
+const QUEUE_STATUS = {
+  queued: ["Queued", ""],
+  waiting: ["Your turn in the browser", "yellow"],
+  downloading: ["Downloading", "blue"],
+  ready: ["Downloaded", "blue"],
+  failed: ["Failed", "red"],
+  installed: ["Installed", "green"],
+};
 
 function viewBrowse() {
-  const input = h("input", {
-    type: "text", placeholder: "Search 7 Days to Die mods on Nexus", "aria-label": "Search Nexus Mods", value: B.query, spellcheck: "false",
-    oninput: (e) => {
-      B.query = e.target.value;
-      clearTimeout(B.timer);
-      B.timer = setTimeout(() => runSearch(true), 450);
-    },
-    onkeydown: (e) => {
-      if (e.key !== "Enter") return;
-      clearTimeout(B.timer);
-      B.query = e.target.value;
-      runSearch(true);
-    },
-  });
+  const tabs = h("div", { class: "seg", role: "tablist", "aria-label": "Browse" },
+    [["search", "Search"], ["recent", "Recently viewed"], ["queue", queueLabel()]].map(([id, label]) => {
+      const b = h("button", { class: B.tab === id ? "on" : "", role: "tab", "aria-selected": B.tab === id ? "true" : "false", onclick: () => { B.tab = id; viewBrowse(); } }, label);
+      if (id === "queue") queueTabBtn = b;
+      return b;
+    }));
+
+  let tools = [];
+  if (B.tab === "search") {
+    const input = h("input", {
+      type: "text", placeholder: "Search 7 Days to Die mods on Nexus", "aria-label": "Search Nexus Mods", value: B.query, spellcheck: "false",
+      oninput: (e) => {
+        B.query = e.target.value;
+        clearTimeout(B.timer);
+        B.timer = setTimeout(() => runSearch(true), 450);
+      },
+      onkeydown: (e) => {
+        if (e.key !== "Enter") return;
+        clearTimeout(B.timer);
+        B.query = e.target.value;
+        runSearch(true);
+      },
+    });
+    tools = [
+      h("div", { class: "search", style: "max-width:360px" }, icon("search"), input),
+      h("div", { class: "seg", role: "group", "aria-label": "Sort" }, SORTS.map(([id, label]) =>
+        h("button", { class: B.sort === id ? "on" : "", onclick: () => { B.sort = id; viewBrowse(); runSearch(true); } }, label))),
+    ];
+  } else if (B.tab === "recent") {
+    tools = [btn("Clear list", clearRecent, { small: true, disabled: !B.recent.length })];
+  } else {
+    const pending = B.queue.filter((q) => ["queued", "failed", "ready"].includes(q.status)).length;
+    tools = [
+      btn(B.running ? "Installing…" : `Install all${pending ? ` (${pending})` : ""}`, installQueue, { kind: "primary", disabled: B.running || !pending }),
+      B.running && btn("Stop", stopQueue, { small: true }),
+      btn("Clear finished", clearFinished, { small: true, disabled: !B.queue.some((q) => q.status === "installed") }),
+    ];
+  }
+
   browseGrid = h("div", { class: "list" });
   browseDetail = h("aside", { class: "detail" });
   browseCount = h("span", { class: "muted" });
   viewEl.replaceChildren(
-    h("div", { class: "toolbar" },
-      h("div", { class: "search", style: "max-width:420px" }, icon("search"), input),
-      h("div", { class: "seg", role: "group", "aria-label": "Sort" }, SORTS.map(([id, label]) =>
-        h("button", { class: B.sort === id ? "on" : "", onclick: () => { B.sort = id; viewBrowse(); runSearch(true); } }, label))),
-      h("div", { class: "spacer" }),
-      browseCount),
+    h("div", { class: "toolbar" }, tabs, tools, h("div", { class: "spacer" }), browseCount),
     h("div", { class: "mods-split" }, browseGrid, browseDetail));
   renderBrowse();
   renderBrowseDetail();
-  if (!B.mods.length && !B.loading && !B.error) runSearch(true);
+  if (B.tab === "search" && !B.mods.length && !B.loading && !B.error) runSearch(true);
+  if (B.tab === "recent" && !B.recentLoaded) loadRecent();
 }
 
 async function runSearch(reset) {
@@ -880,7 +932,23 @@ async function runSearch(reset) {
   if (S.view === "browse") renderBrowse();
 }
 
-function browseCard(m) {
+async function loadRecent() {
+  try {
+    B.recent = await invoke("nexus_recent");
+  } catch (e) {
+    fail(e);
+  }
+  B.recentLoaded = true;
+  if (S.view === "browse" && B.tab === "recent") viewBrowse();
+}
+
+async function clearRecent() {
+  await invoke("nexus_clear_recent").catch(fail);
+  B.recent = [];
+  viewBrowse();
+}
+
+function browseCard(m, foot) {
   const pick = () => selectNexusMod(m);
   return h("div", {
     class: `bcard ${B.selected?.id === m.id ? "sel" : ""}`, role: "button", tabindex: "0", "aria-label": m.name,
@@ -893,11 +961,22 @@ function browseCard(m) {
       h("div", { class: "bstats" }, `${fmtCount(m.endorsements)} endorsements  ·  ${fmtCount(m.downloads)} downloads`),
       h("div", { class: "bfoot" },
         installedFrom(m.id) && h("span", { class: "badge green" }, "Installed"),
-        h("span", { class: "bdate" }, `Updated ${fmtDay(m.updated)}`))));
+        h("span", { class: "bdate" }, foot || `Updated ${fmtDay(m.updated)}`))));
 }
 
 function renderBrowse() {
   if (!browseGrid?.isConnected) return;
+  if (queueTabBtn) queueTabBtn.textContent = queueLabel();
+  if (B.tab === "queue") return renderQueue();
+  if (B.tab === "recent") {
+    browseCount.textContent = B.recent.length ? plural(B.recent.length, "mod") : "";
+    fill(browseGrid, !B.recentLoaded
+      ? h("div", { class: "empty" }, h("b", {}, "Loading…"))
+      : B.recent.length
+        ? h("div", { class: "bgrid" }, B.recent.map((r) => browseCard(r, `Viewed ${fmtDate(r.viewed)}`)))
+        : h("div", { class: "empty" }, h("b", {}, "Nothing viewed yet"), h("div", {}, "Mods you open from Search show up here.")));
+    return;
+  }
   browseCount.textContent = B.total ? `${B.total.toLocaleString()} mods` : "";
   if (B.error && !B.mods.length) {
     fill(browseGrid, h("div", { class: "empty" }, h("b", {}, "Couldn't reach Nexus"), h("div", {}, B.error),
@@ -909,16 +988,50 @@ function renderBrowse() {
     return;
   }
   fill(browseGrid,
-    h("div", { class: "bgrid" }, B.mods.map(browseCard)),
+    h("div", { class: "bgrid" }, B.mods.map((m) => browseCard(m))),
     h("div", { class: "bmore" },
       B.error && h("div", { class: "muted" }, B.error),
       B.mods.length < B.total && btn(B.loading ? "Loading…" : "Load more", () => runSearch(false), { disabled: B.loading })));
+}
+
+function renderQueue() {
+  browseCount.textContent = queueOpen() ? `${plural(queueOpen(), "file")} to install` : "";
+  if (!B.queue.length) {
+    fill(browseGrid, h("div", { class: "empty" }, h("b", {}, "Queue is empty"),
+      h("div", {}, "Open a mod and press Queue on any of its files. Install all then downloads them and shows one review for everything.")));
+    return;
+  }
+  const waiting = B.queue.find((q) => q.status === "waiting");
+  const free = !S.boot.nexus_user?.premium;
+  fill(browseGrid, h("div", { class: "queue" },
+    waiting && h("div", { class: "callout medium" },
+      h("b", {}, `Your turn: ${waiting.mod.name}`),
+      "Nexus is open in your browser. Click Slow download there, and the file comes back here. The next file opens after that.",
+      h("div", { class: "actions" },
+        btn("Open again", () => openForQueue(waiting), { small: true, icon: "link" }),
+        btn("Skip this one", () => skipQueued(waiting), { small: true }))),
+    free && !B.running && queueOpen() > 0 && h("p", { class: "muted" },
+      "With a free Nexus account, each file needs one click on Nexus's site. Install all opens them one after another and installs everything together at the end."),
+    B.queue.map((q) => {
+      const [label, tone] = QUEUE_STATUS[q.status];
+      return h("div", { class: `qrow ${q.status}` },
+        h("div", { class: "qthumb" }, q.mod.picture && h("img", { src: q.mod.picture, alt: "" })),
+        h("div", { class: "qmain" },
+          h("b", {}, q.mod.name),
+          h("div", { class: "cand-sub" }, [q.file.name, q.file.version && `v${q.file.version}`, fmtSize(q.file.size)].filter(Boolean).join("  ·  ")),
+          q.error && h("div", { class: "qerr" }, q.error)),
+        h("span", { class: `badge ${tone}` }, label),
+        q.status !== "downloading" && btn("", () => removeFromQueue(q), { small: true, icon: "trash", title: "Remove from the queue" }));
+    })));
 }
 
 async function selectNexusMod(m) {
   B.selected = m;
   renderBrowse();
   renderBrowseDetail();
+  const snapshot = { id: m.id, name: m.name, summary: m.summary, version: m.version, author: m.author, downloads: m.downloads, endorsements: m.endorsements, picture: m.picture, updated: m.updated };
+  invoke("nexus_note_viewed", { m: snapshot }).catch(() => {});
+  B.recent = [{ ...snapshot, viewed: Math.floor(Date.now() / 1000) }, ...B.recent.filter((r) => r.id !== m.id)].slice(0, 40);
   if (B.files[m.id]) return;
   try {
     B.files[m.id] = await invoke("nexus_files", { modId: m.id });
@@ -935,6 +1048,7 @@ function renderBrowseDetail() {
     fill(browseDetail,
       h("h2", {}, "Browse Nexus"),
       h("p", { class: "muted" }, "Search and sorting work without an account. Pick a mod to see its files."),
+      h("p", { class: "muted" }, "Use Queue on several files to install them together with one review."),
       h("p", { class: "muted" }, "Many mods were made for older game versions. Check a mod's page says it supports your version before installing it."),
       h("p", { class: "muted" }, "Mods turn off crossplay. Use the Vanilla switch to play with console friends."));
     return;
@@ -959,24 +1073,57 @@ function renderBrowseDetail() {
       !files && h("p", { class: "muted" }, "Loading files…"),
       files?.error && h("p", { class: "muted" }, files.error),
       Array.isArray(files) && !files.length && h("p", { class: "muted" }, "No current files. Check the mod page."),
-      Array.isArray(files) && files.map((f) => h("div", { class: "nfile" },
-        h("div", { class: "nfile-main" },
-          h("div", {}, h("b", {}, f.name), " ", h("span", { class: `badge ${f.category === "MAIN" ? "amber" : ""}` }, f.category.toLowerCase())),
-          h("div", { class: "cand-sub" }, [f.version && `v${f.version}`, fmtSize(f.size), f.date && fmtDate(f.date)].filter(Boolean).join("  ·  "))),
-        btn("Download", () => nexusGet(m, f), { small: true, kind: f.category === "MAIN" ? "primary" : "" })))));
+      Array.isArray(files) && files.map((f) => {
+        const queued = B.queue.find((q) => q.key === queueKey(m.id, f.id) && q.status !== "installed");
+        return h("div", { class: "nfile" },
+          h("div", { class: "nfile-main" },
+            h("div", {}, h("b", {}, f.name), " ", h("span", { class: `badge ${f.category === "MAIN" ? "amber" : ""}` }, f.category.toLowerCase())),
+            h("div", { class: "cand-sub" }, [f.version && `v${f.version}`, fmtSize(f.size), f.date && fmtDate(f.date)].filter(Boolean).join("  ·  "))),
+          h("div", { class: "nfile-btns" },
+            btn("Download", () => nexusGet(m, f), { small: true, kind: f.category === "MAIN" ? "primary" : "" }),
+            queued
+              ? btn("Queued", () => removeFromQueue(queued), { small: true, kind: "on", title: "Remove from the install queue", disabled: queued.status === "downloading" })
+              : btn("Queue", () => addToQueue(m, f), { small: true, icon: "plus", title: "Add to the install queue" })));
+      })));
+}
+
+// ---- Nexus downloads and the install queue --------------------------------
+
+async function ensureKey() {
+  if (S.boot.has_key) return true;
+  const open = await dialog({
+    title: "Connect Nexus first",
+    body: [h("p", {}, "Downloads need your free Nexus API key, so the manager can fetch files for you. Add it once in Settings.")],
+    actions: [{ label: "Cancel", value: false }, { label: "Open Settings", value: true, kind: "primary" }],
+  });
+  if (open) go("settings");
+  return false;
+}
+
+/// Free accounts download through Nexus's own page, which hands the file over with an nxm:// link.
+async function ensureHandler() {
+  const handler = await invoke("nexus_handler_status");
+  if (handler.state === "this") return true;
+  const ok = await dialog({
+    title: "One-time setup",
+    body: [
+      h("p", {}, "Free Nexus accounts download through the site's Mod Manager Download button. Let this app receive those links, and each file comes straight back here for you to review."),
+      handler.state === "other" && h("p", {}, "Another app, such as Vortex, receives them right now. This switches them to this app."),
+    ],
+    actions: [{ label: "Cancel", value: false }, { label: "Use this app", value: true, kind: "primary" }],
+  });
+  if (!ok) return false;
+  try {
+    await invoke("nexus_set_handler", { on: true });
+    return true;
+  } catch (e) {
+    fail(e);
+    return false;
+  }
 }
 
 async function nexusGet(m, f) {
-  if (!instId()) return;
-  if (!S.boot.has_key) {
-    const open = await dialog({
-      title: "Connect Nexus first",
-      body: [h("p", {}, "Downloads need your free Nexus API key, so the manager can fetch files for you. Add it once in Settings.")],
-      actions: [{ label: "Cancel", value: false }, { label: "Open Settings", value: true, kind: "primary" }],
-    });
-    if (open) go("settings");
-    return;
-  }
+  if (!instId() || !(await ensureKey())) return;
   if (S.boot.nexus_user?.premium) {
     try {
       const staged = await withBusy(`Downloading ${f.name}`, () => call("nexus_download_file", { modId: m.id, fileId: f.id }), { cancel: true });
@@ -986,31 +1133,158 @@ async function nexusGet(m, f) {
     }
     return;
   }
-  // Free accounts: Nexus only hands files to managers through its own download page.
-  const handler = await invoke("nexus_handler_status");
-  if (handler.state !== "this") {
-    const ok = await dialog({
-      title: "One-time setup",
-      body: [
-        h("p", {}, "Free Nexus accounts download through the site's Mod Manager Download button. Let this app receive those links, and each file comes straight back here for you to review."),
-        handler.state === "other" && h("p", {}, "Another app, such as Vortex, receives them right now. This switches them to this app."),
-      ],
-      actions: [{ label: "Cancel", value: false }, { label: "Use this app", value: true, kind: "primary" }],
-    });
-    if (!ok) return;
-    try {
-      await invoke("nexus_set_handler", { on: true });
-    } catch (e) {
-      fail(e);
-      return;
-    }
-  }
+  if (!(await ensureHandler())) return;
   try {
     await call("open_url", { url: nexusFileUrl(m.id, f.id) });
     toast("Nexus opened in your browser. Click Slow download there, and the file comes back here to review.");
   } catch (e) {
     fail(e);
   }
+}
+
+function queueChanged() {
+  renderNav();
+  if (S.view !== "browse") return;
+  if (B.tab === "queue") viewBrowse();
+  else {
+    if (queueTabBtn) queueTabBtn.textContent = queueLabel();
+    renderBrowseDetail();
+  }
+}
+
+function addToQueue(m, f) {
+  const key = queueKey(m.id, f.id);
+  B.queue = B.queue.filter((q) => !(q.key === key && q.status === "installed"));
+  if (B.queue.some((q) => q.key === key)) return;
+  B.queue.push({
+    key,
+    mod: { id: m.id, name: m.name, picture: m.picture },
+    file: { id: f.id, name: f.name, version: f.version, size: f.size },
+    status: "queued",
+    error: null,
+    dl: null,
+  });
+  toast(`Queued ${f.name}. ${plural(queueOpen(), "file")} in the queue.`);
+  queueChanged();
+}
+
+function removeFromQueue(q) {
+  if (q.dl) invoke("discard_download", { id: q.dl }).catch(() => {});
+  B.queue = B.queue.filter((x) => x !== q);
+  queueChanged();
+  if (B.running) advanceQueue();
+}
+
+function clearFinished() {
+  B.queue = B.queue.filter((q) => q.status !== "installed");
+  queueChanged();
+}
+
+function stopQueue() {
+  B.running = false;
+  B.queue.filter((q) => q.status === "waiting").forEach((q) => (q.status = "queued"));
+  queueChanged();
+}
+
+const openForQueue = (q) => call("open_url", { url: nexusFileUrl(q.mod.id, q.file.id) }).catch(fail);
+
+function skipQueued(q) {
+  q.status = "failed";
+  q.error = "Skipped";
+  queueChanged();
+  advanceQueue();
+}
+
+async function installQueue() {
+  if (!instId() || !(await ensureKey())) return;
+  const premium = S.boot.nexus_user?.premium;
+  if (!premium && !(await ensureHandler())) return;
+  B.queue.filter((q) => q.status === "failed").forEach((q) => {
+    q.status = "queued";
+    q.error = null;
+  });
+  B.running = true;
+  queueChanged();
+  if (premium) {
+    for (const q of B.queue.filter((x) => x.status === "queued")) {
+      if (!B.running) break;
+      await fetchQueued(q, null);
+    }
+    if (B.running) await finishQueue();
+  } else {
+    await advanceQueue();
+  }
+}
+
+/// Free accounts: opens the next file's Nexus page, or installs once nothing is left to fetch.
+async function advanceQueue() {
+  if (!B.running) return;
+  if (B.queue.some((q) => q.status === "waiting" || q.status === "downloading")) return;
+  const next = B.queue.find((q) => q.status === "queued");
+  if (!next) return finishQueue();
+  next.status = "waiting";
+  queueChanged();
+  await openForQueue(next);
+}
+
+async function fetchQueued(q, url) {
+  q.status = "downloading";
+  q.error = null;
+  queueChanged();
+  try {
+    const d = await withBusy(`Downloading ${q.file.name}`, () => invoke("nexus_fetch", { url, modId: q.mod.id, fileId: q.file.id }), { cancel: true });
+    q.dl = d.id;
+    q.status = "ready";
+  } catch (e) {
+    if (String(e) === CANCELLED) {
+      q.status = "queued";
+      B.running = false;
+      toast("Queue paused", "warn");
+    } else {
+      q.status = "failed";
+      q.error = String(e);
+    }
+  }
+  queueChanged();
+}
+
+async function finishQueue() {
+  B.running = false;
+  const ready = B.queue.filter((q) => q.status === "ready");
+  queueChanged();
+  if (!ready.length) {
+    if (B.queue.some((q) => q.status === "failed")) toast("Nothing was downloaded. Check the failed files in the queue.", "warn");
+    return;
+  }
+  let staged;
+  try {
+    staged = await withBusy("Unpacking queued mods", () => call("prepare_downloads", { ids: ready.map((q) => q.dl) }));
+  } catch (e) {
+    ready.forEach((q) => {
+      q.status = "failed";
+      q.error = String(e);
+      q.dl = null;
+    });
+    queueChanged();
+    return;
+  }
+  // The downloads were consumed by staging. Anything not installed now needs fetching again.
+  ready.forEach((q) => {
+    q.dl = null;
+    q.status = "queued";
+    if (!staged.candidates.some((c) => c.nexus?.file_id === q.file.id)) {
+      q.status = "failed";
+      q.error = "No installable mod inside (no ModInfo.xml).";
+    }
+  });
+  const outcome = await reviewInstall(staged);
+  if (outcome) {
+    for (const q of ready) {
+      const mine = outcome.chosen.filter((c) => c.nexus?.file_id === q.file.id);
+      if (mine.length && mine.every((c) => outcome.result.installed.includes(c.title))) q.status = "installed";
+    }
+  }
+  queueChanged();
 }
 
 // ---- profiles --------------------------------------------------------------

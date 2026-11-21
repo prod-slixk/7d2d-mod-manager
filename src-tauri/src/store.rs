@@ -112,6 +112,8 @@ pub struct Data {
     pub save_tags: HashMap<String, HashMap<String, SaveTag>>,
     pub sessions: HashMap<String, Session>,
     pub mismatches: HashMap<String, Vec<Mismatch>>,
+    /// Nexus mods opened in Browse, newest first.
+    pub recent_nexus: Vec<crate::nexus::RecentMod>,
 }
 
 pub struct App {
@@ -123,6 +125,8 @@ pub struct App {
     pub pending_nxm: Mutex<Vec<String>>,
     /// Set by the Cancel button to stop the running download.
     pub cancel_download: std::sync::atomic::AtomicBool,
+    /// Files downloaded for the install queue, waiting to be staged together.
+    pub downloads: Mutex<HashMap<String, crate::nexus::Downloaded>>,
 }
 
 /// A `data` folder beside the exe switches the app to fully portable storage.
@@ -143,8 +147,9 @@ impl App {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
-        // Staging from an earlier session can never be committed.
+        // Staging and queued downloads from an earlier session can never be used.
         let _ = std::fs::remove_dir_all(dir.join("staging"));
+        let _ = std::fs::remove_dir_all(dir.join("downloads"));
         Self {
             dir,
             saves: crate::mods::user_data_dir().map(|u| u.join("Saves")),
@@ -152,6 +157,7 @@ impl App {
             staging: Mutex::new(HashMap::new()),
             pending_nxm: Mutex::new(Vec::new()),
             cancel_download: std::sync::atomic::AtomicBool::new(false),
+            downloads: Mutex::new(HashMap::new()),
         }
     }
 

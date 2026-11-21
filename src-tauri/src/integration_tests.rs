@@ -110,6 +110,27 @@ fn install_from_zip_with_wrapper_and_loose_root() {
 }
 
 #[test]
+fn queued_downloads_install_together_and_each_keeps_its_nexus_link() {
+    let s = sim();
+    let src = s._tmp.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    let (a, b) = (src.join("a.zip"), src.join("b.zip"));
+    make_zip(&a, &[("Echo/ModInfo.xml", &modinfo("Echo", "1.0"))]);
+    make_zip(&b, &[("Foxtrot/ModInfo.xml", &modinfo("Foxtrot", "2.0"))]);
+    let link = |mod_id, file_id, v: &str| crate::store::NexusLink { mod_id, file_id: Some(file_id), version: Some(v.into()), latest: None, title: None };
+    let sources = vec![(a.to_string_lossy().to_string(), Some(link(11, 110, "1.0"))), (b.to_string_lossy().to_string(), Some(link(22, 220, "2.0")))];
+
+    let staged = install::prepare_sources(&s.app, &scan(&s), &sources, &|_| {}).unwrap();
+    assert_eq!(staged.candidates.len(), 2, "one review covers every queued file");
+    let ids: Vec<String> = staged.candidates.iter().map(|c| c.id.clone()).collect();
+    install::commit(&s.app, &s.inst, &staged, &ids).unwrap();
+
+    let links = s.app.links_for(&s.inst.id);
+    assert_eq!((links["Echo"].mod_id, links["Echo"].file_id), (11, Some(110)));
+    assert_eq!((links["Foxtrot"].mod_id, links["Foxtrot"].file_id), (22, Some(220)));
+}
+
+#[test]
 fn zip_slip_entries_never_escape_staging() {
     let s = sim();
     let z = s._tmp.path().join("evil.zip");

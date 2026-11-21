@@ -135,7 +135,6 @@ pub fn import(app: &App, existing: &[ModEntry], path: &Path, progress: &dyn Fn(&
             dir: dir.clone(),
             candidates,
             errors: Vec::new(),
-            nexus: None,
             import: Some(Manifest {
                 name: pack.name,
                 mods: pack.mods.into_iter().map(|m| ModRef { folder: m.folder, name: m.name, version: m.version, nexus_id: m.nexus_id }).collect(),

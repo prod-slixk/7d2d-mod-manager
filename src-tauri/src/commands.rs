@@ -500,12 +500,87 @@ pub fn take_pending_nxm(app: State<App>) -> Vec<String> {
     std::mem::take(&mut *app.pending_nxm.lock().unwrap_or_else(|p| p.into_inner()))
 }
 
-fn stage_download(handle: &AppHandle, app: &App, i: &Instance, d: nexus::Downloaded) -> R<Staging> {
+/// Stages downloaded files together, then deletes the downloads.
+fn stage_downloads(handle: &AppHandle, app: &App, i: &Instance, items: Vec<nexus::Downloaded>) -> R<Staging> {
     let list = scan(app, i);
-    let paths = [d.path.to_string_lossy().to_string()];
-    let staged = install::prepare(app, &list, &paths, Some(d.link), &|m| notify(handle, m, None));
-    let _ = std::fs::remove_file(&d.path);
+    let sources: Vec<(String, Option<NexusLink>)> = items.iter().map(|d| (d.path.to_string_lossy().to_string(), Some(d.link.clone()))).collect();
+    let staged = install::prepare_sources(app, &list, &sources, &|m| notify(handle, m, None));
+    items.iter().for_each(|d| d.discard());
     Ok(keep(app, staged?))
+}
+
+fn stage_download(handle: &AppHandle, app: &App, i: &Instance, d: nexus::Downloaded) -> R<Staging> {
+    stage_downloads(handle, app, i, vec![d])
+}
+
+#[derive(Serialize)]
+pub struct Fetched {
+    id: String,
+    name: String,
+    size: u64,
+}
+
+/// Downloads one queued file and holds it until the whole queue is staged.
+/// `url` is the nxm:// link for free accounts. Without it, this is a Premium direct download.
+#[tauri::command(async)]
+pub fn nexus_fetch(handle: AppHandle, app: State<App>, url: Option<String>, mod_id: u64, file_id: u64) -> R<Fetched> {
+    app.cancel_download.store(false, Ordering::Relaxed);
+    let progress = |m: &str, f: Option<f64>| notify(&handle, m, f);
+    let d = match url {
+        Some(u) => {
+            let link = nexus::parse_nxm(&u)?;
+            if (link.mod_id, link.file_id) != (mod_id, file_id) {
+                return Err("That Nexus link is for a different file.".into());
+            }
+            nexus::download(&app.dir, &u, &progress, &app.cancel_download)?
+        }
+        None => nexus::download_file(&app.dir, mod_id, file_id, None, &progress, &app.cancel_download)?,
+    };
+    let fetched = Fetched {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: d.path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+        size: std::fs::metadata(&d.path).map(|m| m.len()).unwrap_or(0),
+    };
+    app.downloads.lock().unwrap_or_else(|p| p.into_inner()).insert(fetched.id.clone(), d);
+    Ok(fetched)
+}
+
+/// Stages every listed queued download into one review.
+#[tauri::command(async)]
+pub fn prepare_downloads(handle: AppHandle, app: State<App>, inst: String, ids: Vec<String>) -> R<Staging> {
+    let i = app.instance(&inst)?;
+    let items: Vec<nexus::Downloaded> = {
+        let mut held = app.downloads.lock().unwrap_or_else(|p| p.into_inner());
+        ids.iter().filter_map(|id| held.remove(id)).collect()
+    };
+    if items.is_empty() {
+        return Err("Those downloads are no longer available. Add them to the queue again.".into());
+    }
+    stage_downloads(&handle, &app, &i, items)
+}
+
+#[tauri::command(async)]
+pub fn discard_download(app: State<App>, id: String) {
+    if let Some(d) = app.downloads.lock().unwrap_or_else(|p| p.into_inner()).remove(&id) {
+        d.discard();
+    }
+}
+
+#[tauri::command(async)]
+pub fn nexus_recent(app: State<App>) -> Vec<nexus::RecentMod> {
+    app.read(|d| d.recent_nexus.clone())
+}
+
+#[tauri::command(async)]
+pub fn nexus_note_viewed(app: State<App>, m: nexus::NexusMod) -> R<()> {
+    let Some(m) = nexus::clean_viewed(m) else { return Ok(()) };
+    let now = chrono::Utc::now().timestamp();
+    app.write(|d| nexus::push_recent(&mut d.recent_nexus, m, now, 40))
+}
+
+#[tauri::command(async)]
+pub fn nexus_clear_recent(app: State<App>) -> R<()> {
+    app.write(|d| d.recent_nexus.clear())
 }
 
 /// Downloads an nxm:// link's file, then stages it. Nothing installs until the user confirms.
