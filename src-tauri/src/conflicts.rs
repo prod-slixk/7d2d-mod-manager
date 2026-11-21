@@ -44,6 +44,9 @@ pub struct Edit {
     pub xpath: String,
     pub op: String,
     pub value: String,
+    /// For csv edits: "add" or "remove", and the separator between entries.
+    pub list_op: String,
+    pub delim: String,
 }
 
 /// Normalizes spacing and quote style so equal xpaths compare equal.
@@ -101,7 +104,9 @@ fn collect(node: roxmltree::Node, mod_idx: usize, file: &str, out: &mut Vec<Edit
             }
         }
         let value = child.text().unwrap_or("").trim().to_string();
-        out.push(Edit { mod_idx, file: file.to_string(), xpath, op: tag, value });
+        let list_op = child.attribute("op").unwrap_or("add").trim().to_ascii_lowercase();
+        let delim = child.attribute("delim").filter(|d| !d.is_empty()).unwrap_or(",").to_string();
+        out.push(Edit { mod_idx, file: file.to_string(), xpath, op: tag, value, list_op, delim });
     }
 }
 
@@ -154,6 +159,23 @@ pub fn compare(mods: &[ModEntry], edits: &[Edit]) -> Vec<Issue> {
         }
         let removes = writers.iter().any(|e| e.op == "remove" || e.op == "removeattribute");
         let csv = writers.iter().any(|e| e.op == "csv");
+        // List edits that only add entries stack up, so load order doesn't matter. They only
+        // disagree when one mod removes an entry another mod adds.
+        let mut list_clash = Vec::new();
+        if writers.iter().all(|e| e.op == "csv") {
+            let entries = |e: &Edit| -> Vec<String> { e.value.split(e.delim.as_str()).map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect() };
+            for r in writers.iter().filter(|e| e.list_op == "remove") {
+                for a in writers.iter().filter(|e| e.list_op != "remove" && e.mod_idx != r.mod_idx) {
+                    let added = entries(a);
+                    list_clash.extend(entries(r).into_iter().filter(|x| added.contains(x)));
+                }
+            }
+            list_clash.sort();
+            list_clash.dedup();
+            if list_clash.is_empty() {
+                continue;
+            }
+        }
         // Mods that write the same value don't actually disagree.
         if !removes && !csv && writers.iter().all(|e| e.value == writers[0].value) {
             continue;
@@ -162,7 +184,13 @@ pub fn compare(mods: &[ModEntry], edits: &[Edit]) -> Vec<Issue> {
         let (severity, kind, title, detail) = if removes {
             ("high", "remove", "One mod removes what another changes", format!("Whichever runs later may fail. {winner} loads last."))
         } else if csv {
-            ("medium", "csv", "Mods edit the same list", "Results depend on load order. Check that the combination does what you expect.".to_string())
+            let detail = if list_clash.is_empty() {
+                "Results depend on load order. Check that the combination does what you expect.".to_string()
+            } else {
+                let shown: Vec<&str> = list_clash.iter().take(5).map(String::as_str).collect();
+                format!("One mod removes entries another adds ({}). {winner} loads last, so its edit decides.", shown.join(", "))
+            };
+            ("medium", "csv", "Mods edit the same list", detail)
         } else {
             ("medium", "override", "Mods set the same value", format!("Only one value can apply. {winner} loads last, so its value wins."))
         };
@@ -329,6 +357,23 @@ mod tests {
     fn ignores_slashes_inside_predicates() {
         let p = "/items/item[@name='a/b']/property";
         assert_eq!(step_ends(p).iter().map(|e| &p[..*e]).collect::<Vec<_>>(), vec!["/items", "/items/item[@name='a/b']"]);
+    }
+
+    #[test]
+    fn list_additions_from_several_mods_are_not_a_conflict() {
+        let t = tempfile::tempdir().unwrap();
+        let xp = "/items/item[@name='book']/property[@name='Unlocks']/@value";
+        let a = make(t.path(), "A", 0, &format!(r#"<configs><csv xpath="{xp}" delim="," op="add">modA1,modA2</csv></configs>"#));
+        let b = make(t.path(), "B", 1, &format!(r#"<configs><csv xpath="{xp}" delim="," op="add">modB1</csv></configs>"#));
+        assert!(analyze(&[a.clone(), b.clone()]).issues.is_empty(), "both lists of additions apply");
+
+        let c = make(t.path(), "C", 2, &format!(r#"<configs><csv xpath="{xp}" delim="," op="remove">modZ</csv></configs>"#));
+        assert!(analyze(&[a.clone(), c]).issues.is_empty(), "removing an entry nobody adds is harmless");
+
+        let d = make(t.path(), "D", 3, &format!(r#"<configs><csv xpath="{xp}" delim="," op="remove">modA2</csv></configs>"#));
+        let r = analyze(&[a, b, d]);
+        assert_eq!(r.issues.len(), 1, "removing another mod's entry depends on load order");
+        assert!(r.issues[0].detail.contains("modA2"));
     }
 
     #[test]
