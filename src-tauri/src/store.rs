@@ -121,6 +121,8 @@ pub struct App {
     pub data: Mutex<Data>,
     pub staging: Mutex<HashMap<String, Staging>>,
     pub pending_nxm: Mutex<Vec<String>>,
+    /// Set by the Cancel button to stop the running download.
+    pub cancel_download: std::sync::atomic::AtomicBool,
 }
 
 /// A `data` folder beside the exe switches the app to fully portable storage.
@@ -149,6 +151,7 @@ impl App {
             data: Mutex::new(data),
             staging: Mutex::new(HashMap::new()),
             pending_nxm: Mutex::new(Vec::new()),
+            cancel_download: std::sync::atomic::AtomicBool::new(false),
         }
     }
 

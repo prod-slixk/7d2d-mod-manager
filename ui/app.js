@@ -34,6 +34,7 @@ function fill(el, ...kids) {
 const ICONS = {
   mods: "M21 8 12 3 3 8v8l9 5 9-5V8ZM3 8l9 5 9-5M12 13v8",
   profiles: "m12 3 9 5-9 5-9-5 9-5ZM3 13l9 5 9-5M3 17.5l9 5 9-5",
+  browse: "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18ZM15.5 8.5l-2 5-5 2 2-5 5-2Z",
   worlds: "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18ZM3.5 9h17M3.5 15h17M12 3c2.4 2.5 3.6 5.5 3.6 9s-1.2 6.5-3.6 9c-2.4-2.5-3.6-5.5-3.6-9S9.6 5.5 12 3Z",
   conflicts: "M12 3 2 20h20L12 3ZM12 10v5M12 17.5v.5",
   backups: "M3 4h18v5H3zM5 9v11h14V9M10 13h4",
@@ -115,7 +116,9 @@ function toast(message, kind = "ok") {
 
 const fail = (e) => toast(String(e), "error");
 
-let busyEl = null;
+// Built once and updated in place: progress arrives many times a second, and
+// rebuilding would swallow clicks on the Cancel button.
+let busyEl = null, busyText, busyCancelBtn, busyFill, busyCancellable = false;
 function setBusy(message, fraction) {
   if (message === null) {
     busyEl?.remove();
@@ -123,23 +126,35 @@ function setBusy(message, fraction) {
     return;
   }
   if (!busyEl) {
-    busyEl = h("div", { class: "busy", role: "status" });
+    busyText = h("span", {});
+    busyCancelBtn = btn("Cancel", () => {
+      busyCancelBtn.disabled = true;
+      invoke("cancel_download");
+    }, { small: true });
+    busyFill = h("div", { class: "busy-fill" });
+    busyEl = h("div", { class: "busy", role: "status" }, busyText, busyCancelBtn, h("div", { class: "busy-track" }, busyFill));
     document.body.append(busyEl);
   }
+  busyCancelBtn.hidden = !busyCancellable;
+  busyText.textContent = message;
   const indeterminate = fraction === null || fraction === undefined;
-  const fill = h("div", { class: `busy-fill ${indeterminate ? "indet" : ""}` });
-  if (!indeterminate) fill.style.width = `${Math.round(fraction * 100)}%`;
-  busyEl.replaceChildren(message, h("div", { class: "busy-track" }, fill));
+  busyFill.className = `busy-fill ${indeterminate ? "indet" : ""}`;
+  busyFill.style.width = indeterminate ? "" : `${Math.round(fraction * 100)}%`;
 }
 
-async function withBusy(message, fn) {
+async function withBusy(message, fn, { cancel = false } = {}) {
+  busyCancellable = cancel;
   setBusy(message);
   try {
     return await fn();
   } finally {
+    busyCancellable = false;
     setBusy(null);
   }
 }
+
+const CANCELLED = "Download cancelled.";
+const downloadFail = (e) => (String(e) === CANCELLED ? toast("Download cancelled", "warn") : fail(e));
 
 function dialog({ title, body, actions, onKey }) {
   return new Promise((resolve) => {
@@ -311,6 +326,7 @@ const issueCount = (sev) => (S.report?.issues || []).filter((i) => i.severity ==
 
 const NAV = [
   ["mods", "Mods", "mods"],
+  ["browse", "Browse Nexus", "browse"],
   ["profiles", "Profiles", "profiles"],
   ["worlds", "Worlds", "worlds"],
   ["conflicts", "Conflicts", "conflicts"],
@@ -430,7 +446,7 @@ function go(view) {
 
 function renderView() {
   if (!viewEl) return;
-  const view = { mods: viewMods, profiles: viewProfiles, worlds: viewWorlds, conflicts: viewConflicts, backups: viewBackups, logs: viewLogs, settings: viewSettings }[S.view];
+  const view = { mods: viewMods, browse: viewBrowse, profiles: viewProfiles, worlds: viewWorlds, conflicts: viewConflicts, backups: viewBackups, logs: viewLogs, settings: viewSettings }[S.view];
   Promise.resolve().then(view).catch(fail);
 }
 
@@ -790,14 +806,210 @@ async function handleNxm() {
         continue;
       }
       try {
-        const staged = await withBusy("Contacting Nexus", () => call("nexus_download", { url }));
+        const staged = await withBusy("Contacting Nexus", () => call("nexus_download", { url }), { cancel: true });
         await reviewInstall(staged);
       } catch (e) {
-        fail(e);
+        downloadFail(e);
       }
     }
   } finally {
     nxmBusy = false;
+  }
+}
+
+// ---- browse Nexus ----------------------------------------------------------
+
+const SORTS = [["endorsements", "Most endorsed"], ["downloads", "Most downloaded"], ["updated", "Recently updated"], ["newest", "Newest"]];
+const B = { query: "", sort: "endorsements", mods: [], total: 0, loading: false, error: null, selected: null, files: {}, token: 0, timer: null };
+let browseGrid, browseDetail, browseCount;
+
+const fmtCount = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}K` : String(n));
+const fmtDay = (iso) => (iso ? new Date(iso).toLocaleDateString([], { dateStyle: "medium" }) : "");
+const installedFrom = (id) => S.mods.find((m) => m.nexus?.mod_id === id);
+const nexusFileUrl = (modId, fileId) => `https://www.nexusmods.com/7daystodie/mods/${modId}?tab=files&file_id=${fileId}&nmm=1`;
+
+function viewBrowse() {
+  const input = h("input", {
+    type: "text", placeholder: "Search 7 Days to Die mods on Nexus", "aria-label": "Search Nexus Mods", value: B.query, spellcheck: "false",
+    oninput: (e) => {
+      B.query = e.target.value;
+      clearTimeout(B.timer);
+      B.timer = setTimeout(() => runSearch(true), 450);
+    },
+    onkeydown: (e) => {
+      if (e.key !== "Enter") return;
+      clearTimeout(B.timer);
+      B.query = e.target.value;
+      runSearch(true);
+    },
+  });
+  browseGrid = h("div", { class: "list" });
+  browseDetail = h("aside", { class: "detail" });
+  browseCount = h("span", { class: "muted" });
+  viewEl.replaceChildren(
+    h("div", { class: "toolbar" },
+      h("div", { class: "search", style: "max-width:420px" }, icon("search"), input),
+      h("div", { class: "seg", role: "group", "aria-label": "Sort" }, SORTS.map(([id, label]) =>
+        h("button", { class: B.sort === id ? "on" : "", onclick: () => { B.sort = id; viewBrowse(); runSearch(true); } }, label))),
+      h("div", { class: "spacer" }),
+      browseCount),
+    h("div", { class: "mods-split" }, browseGrid, browseDetail));
+  renderBrowse();
+  renderBrowseDetail();
+  if (!B.mods.length && !B.loading && !B.error) runSearch(true);
+}
+
+async function runSearch(reset) {
+  const token = ++B.token;
+  if (reset) B.mods = [];
+  B.loading = true;
+  B.error = null;
+  if (S.view === "browse") renderBrowse();
+  try {
+    const page = await invoke("nexus_search", { query: B.query, sort: B.sort, offset: B.mods.length });
+    if (token !== B.token) return;
+    // A page can overlap the last one when Nexus reorders between requests.
+    const seen = new Set(B.mods.map((m) => m.id));
+    B.mods = B.mods.concat(page.mods.filter((m) => !seen.has(m.id)));
+    B.total = page.total;
+  } catch (e) {
+    if (token !== B.token) return;
+    B.error = String(e);
+  }
+  B.loading = false;
+  if (S.view === "browse") renderBrowse();
+}
+
+function browseCard(m) {
+  const pick = () => selectNexusMod(m);
+  return h("div", {
+    class: `bcard ${B.selected?.id === m.id ? "sel" : ""}`, role: "button", tabindex: "0", "aria-label": m.name,
+    onclick: pick, onkeydown: (e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), pick()),
+  },
+    h("div", { class: "bthumb" }, m.picture ? h("img", { src: m.picture, alt: "", loading: "lazy" }) : h("span", {}, "No image")),
+    h("div", { class: "bbody" },
+      h("div", { class: "btitle" }, m.name),
+      h("div", { class: "bsub" }, m.author),
+      h("div", { class: "bstats" }, `${fmtCount(m.endorsements)} endorsements  ·  ${fmtCount(m.downloads)} downloads`),
+      h("div", { class: "bfoot" },
+        installedFrom(m.id) && h("span", { class: "badge green" }, "Installed"),
+        h("span", { class: "bdate" }, `Updated ${fmtDay(m.updated)}`))));
+}
+
+function renderBrowse() {
+  if (!browseGrid?.isConnected) return;
+  browseCount.textContent = B.total ? `${B.total.toLocaleString()} mods` : "";
+  if (B.error && !B.mods.length) {
+    fill(browseGrid, h("div", { class: "empty" }, h("b", {}, "Couldn't reach Nexus"), h("div", {}, B.error),
+      h("div", { class: "actions" }, btn("Try again", () => runSearch(true), { icon: "refresh" }))));
+    return;
+  }
+  if (!B.mods.length) {
+    fill(browseGrid, h("div", { class: "empty" }, B.loading ? h("b", {}, "Searching…") : [h("b", {}, "No mods found"), h("div", {}, "Try a shorter or different search.")]));
+    return;
+  }
+  fill(browseGrid,
+    h("div", { class: "bgrid" }, B.mods.map(browseCard)),
+    h("div", { class: "bmore" },
+      B.error && h("div", { class: "muted" }, B.error),
+      B.mods.length < B.total && btn(B.loading ? "Loading…" : "Load more", () => runSearch(false), { disabled: B.loading })));
+}
+
+async function selectNexusMod(m) {
+  B.selected = m;
+  renderBrowse();
+  renderBrowseDetail();
+  if (B.files[m.id]) return;
+  try {
+    B.files[m.id] = await invoke("nexus_files", { modId: m.id });
+  } catch (e) {
+    B.files[m.id] = { error: String(e) };
+  }
+  if (S.view === "browse" && B.selected?.id === m.id) renderBrowseDetail();
+}
+
+function renderBrowseDetail() {
+  if (!browseDetail?.isConnected) return;
+  const m = B.selected;
+  if (!m) {
+    fill(browseDetail,
+      h("h2", {}, "Browse Nexus"),
+      h("p", { class: "muted" }, "Search and sorting work without an account. Pick a mod to see its files."),
+      h("p", { class: "muted" }, "Many mods were made for older game versions. Check a mod's page says it supports your version before installing it."),
+      h("p", { class: "muted" }, "Mods turn off crossplay. Use the Vanilla switch to play with console friends."));
+    return;
+  }
+  const files = B.files[m.id];
+  const have = installedFrom(m.id);
+  fill(browseDetail,
+    m.picture && h("div", { class: "dthumb" }, h("img", { src: m.picture, alt: "" })),
+    h("div", { class: "detail-title" }, m.name),
+    h("div", { class: "badges" },
+      have ? h("span", { class: "badge green" }, `Installed ${have.version}`.trim()) : null,
+      m.version && h("span", { class: "badge" }, `Nexus v${m.version}`)),
+    m.summary && h("p", { class: "desc" }, m.summary),
+    h("dl", { class: "meta" },
+      h("dt", {}, "Author"), h("dd", {}, m.author),
+      h("dt", {}, "Updated"), h("dd", {}, fmtDay(m.updated)),
+      h("dt", {}, "Endorsed"), h("dd", {}, m.endorsements.toLocaleString()),
+      h("dt", {}, "Downloads"), h("dd", {}, m.downloads.toLocaleString())),
+    h("div", { class: "actions" }, btn("Open on Nexus", () => call("open_url", { url: nexusUrl(m.id) }).catch(fail), { small: true, icon: "link" })),
+    h("div", { class: "detail-section" },
+      h("h3", {}, "Files"),
+      !files && h("p", { class: "muted" }, "Loading files…"),
+      files?.error && h("p", { class: "muted" }, files.error),
+      Array.isArray(files) && !files.length && h("p", { class: "muted" }, "No current files. Check the mod page."),
+      Array.isArray(files) && files.map((f) => h("div", { class: "nfile" },
+        h("div", { class: "nfile-main" },
+          h("div", {}, h("b", {}, f.name), " ", h("span", { class: `badge ${f.category === "MAIN" ? "amber" : ""}` }, f.category.toLowerCase())),
+          h("div", { class: "cand-sub" }, [f.version && `v${f.version}`, fmtSize(f.size), f.date && fmtDate(f.date)].filter(Boolean).join("  ·  "))),
+        btn("Download", () => nexusGet(m, f), { small: true, kind: f.category === "MAIN" ? "primary" : "" })))));
+}
+
+async function nexusGet(m, f) {
+  if (!instId()) return;
+  if (!S.boot.has_key) {
+    const open = await dialog({
+      title: "Connect Nexus first",
+      body: [h("p", {}, "Downloads need your free Nexus API key, so the manager can fetch files for you. Add it once in Settings.")],
+      actions: [{ label: "Cancel", value: false }, { label: "Open Settings", value: true, kind: "primary" }],
+    });
+    if (open) go("settings");
+    return;
+  }
+  if (S.boot.nexus_user?.premium) {
+    try {
+      const staged = await withBusy(`Downloading ${f.name}`, () => call("nexus_download_file", { modId: m.id, fileId: f.id }), { cancel: true });
+      await reviewInstall(staged);
+    } catch (e) {
+      downloadFail(e);
+    }
+    return;
+  }
+  // Free accounts: Nexus only hands files to managers through its own download page.
+  const handler = await invoke("nexus_handler_status");
+  if (handler.state !== "this") {
+    const ok = await dialog({
+      title: "One-time setup",
+      body: [
+        h("p", {}, "Free Nexus accounts download through the site's Mod Manager Download button. Let this app receive those links, and each file comes straight back here for you to review."),
+        handler.state === "other" && h("p", {}, "Another app, such as Vortex, receives them right now. This switches them to this app."),
+      ],
+      actions: [{ label: "Cancel", value: false }, { label: "Use this app", value: true, kind: "primary" }],
+    });
+    if (!ok) return;
+    try {
+      await invoke("nexus_set_handler", { on: true });
+    } catch (e) {
+      fail(e);
+      return;
+    }
+  }
+  try {
+    await call("open_url", { url: nexusFileUrl(m.id, f.id) });
+    toast("Nexus opened in your browser. Click Slow download there, and the file comes back here to review.");
+  } catch (e) {
+    fail(e);
   }
 }
 

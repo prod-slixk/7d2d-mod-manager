@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::Ordering;
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -499,16 +500,45 @@ pub fn take_pending_nxm(app: State<App>) -> Vec<String> {
     std::mem::take(&mut *app.pending_nxm.lock().unwrap_or_else(|p| p.into_inner()))
 }
 
-/// Downloads a file, then stages it. Nothing installs until the user confirms.
+fn stage_download(handle: &AppHandle, app: &App, i: &Instance, d: nexus::Downloaded) -> R<Staging> {
+    let list = scan(app, i);
+    let paths = [d.path.to_string_lossy().to_string()];
+    let staged = install::prepare(app, &list, &paths, Some(d.link), &|m| notify(handle, m, None));
+    let _ = std::fs::remove_file(&d.path);
+    Ok(keep(app, staged?))
+}
+
+/// Downloads an nxm:// link's file, then stages it. Nothing installs until the user confirms.
 #[tauri::command(async)]
 pub fn nexus_download(handle: AppHandle, app: State<App>, inst: String, url: String) -> R<Staging> {
     let i = app.instance(&inst)?;
-    let d = nexus::download(&app.dir, &url, &|m, f| notify(&handle, m, f))?;
-    let list = scan(&app, &i);
-    let paths = [d.path.to_string_lossy().to_string()];
-    let staged = install::prepare(&app, &list, &paths, Some(d.link), &|m| notify(&handle, m, None));
-    let _ = std::fs::remove_file(&d.path);
-    Ok(keep(&app, staged?))
+    app.cancel_download.store(false, Ordering::Relaxed);
+    let d = nexus::download(&app.dir, &url, &|m, f| notify(&handle, m, f), &app.cancel_download)?;
+    stage_download(&handle, &app, &i, d)
+}
+
+/// Premium only: downloads a file picked in Browse, then stages it.
+#[tauri::command(async)]
+pub fn nexus_download_file(handle: AppHandle, app: State<App>, inst: String, mod_id: u64, file_id: u64) -> R<Staging> {
+    let i = app.instance(&inst)?;
+    app.cancel_download.store(false, Ordering::Relaxed);
+    let d = nexus::download_file(&app.dir, mod_id, file_id, None, &|m, f| notify(&handle, m, f), &app.cancel_download)?;
+    stage_download(&handle, &app, &i, d)
+}
+
+#[tauri::command(async)]
+pub fn cancel_download(app: State<App>) {
+    app.cancel_download.store(true, Ordering::Relaxed);
+}
+
+#[tauri::command(async)]
+pub fn nexus_search(query: String, sort: String, offset: u64) -> R<nexus::SearchPage> {
+    nexus::search(&query, &sort, offset)
+}
+
+#[tauri::command(async)]
+pub fn nexus_files(mod_id: u64) -> R<Vec<nexus::NexusFile>> {
+    nexus::files(mod_id)
 }
 
 #[tauri::command(async)]

@@ -2211,7 +2211,7 @@ dependencies = [
 
 [[package]]
 name = "mod-manager-7d2d"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "chrono",
  "keyring",
