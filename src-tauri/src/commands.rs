@@ -1,5 +1,6 @@
 //! The commands the interface can call.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::Ordering;
@@ -623,11 +624,9 @@ pub fn nexus_link_mod(app: State<App>, inst: String, folder: String, reference: 
     let list = scan(&app, &i);
     let version = list.iter().find(|m| m.folder == folder).map(|m| m.version.clone());
     let mut link = NexusLink { mod_id, version, ..Default::default() };
-    if let Some(key) = nexus::get_key() {
-        if let Ok((latest, title)) = nexus::latest_version(&nexus::http_client()?, &key, mod_id) {
-            link.latest = latest;
-            link.title = title;
-        }
+    // Linking by hand never says which file is installed, so the check can only match versions.
+    if let Ok(files) = nexus::all_files(mod_id) {
+        apply_assessment(&mut link, &files, "");
     }
     app.write(|d| {
         d.links.entry(inst).or_default().insert(folder, link);
@@ -643,43 +642,61 @@ pub fn nexus_unlink_mod(app: State<App>, inst: String, folder: String) -> R<()> 
     })
 }
 
+fn apply_assessment(link: &mut NexusLink, files: &[nexus::NexusFile], modinfo_version: &str) {
+    let installed = link.version.clone().filter(|v| !v.is_empty()).unwrap_or_else(|| modinfo_version.to_string());
+    let a = nexus::assess(link.file_id, &installed, files);
+    link.status = Some(a.status.to_string());
+    link.latest = a.latest;
+    link.latest_file = a.latest_file;
+}
+
 #[derive(Serialize)]
 pub struct UpdateCheck {
     checked: usize,
     updates: Vec<String>,
+    /// Mods whose installed Nexus file can't be identified.
+    unknown: Vec<String>,
     errors: Vec<String>,
 }
 
 #[tauri::command(async)]
 pub fn nexus_check_updates(handle: AppHandle, app: State<App>, inst: String) -> R<UpdateCheck> {
-    let key = nexus::get_key().ok_or("Add your Nexus API key in Settings first.")?;
     let i = app.instance(&inst)?;
     let links = app.links_for(&inst);
-    let http = nexus::http_client()?;
-    let mut result = UpdateCheck { checked: 0, updates: Vec::new(), errors: Vec::new() };
+    let versions: HashMap<String, String> = scan(&app, &i).into_iter().map(|m| (m.folder, m.version)).collect();
+    let mut cache: HashMap<u64, Vec<nexus::NexusFile>> = HashMap::new();
+    let mut result = UpdateCheck { checked: 0, updates: Vec::new(), unknown: Vec::new(), errors: Vec::new() };
     let total = links.len().max(1) as f64;
     for (n, (folder, link)) in links.iter().enumerate() {
         notify(&handle, &format!("Checking {folder}"), Some(n as f64 / total));
-        match nexus::latest_version(&http, &key, link.mod_id) {
-            Ok((latest, title)) => {
-                result.checked += 1;
-                let (id, folder) = (inst.clone(), folder.clone());
-                app.write(|d| {
-                    if let Some(l) = d.links.get_mut(&id).and_then(|m| m.get_mut(&folder)) {
-                        l.latest = latest;
-                        l.title = title;
-                    }
-                })?;
-            }
-            Err(e) => {
-                result.errors.push(format!("{folder}: {e}"));
-                if e.contains("rate limit") || e.contains("API key") {
-                    break;
+        if !cache.contains_key(&link.mod_id) {
+            match nexus::all_files(link.mod_id) {
+                Ok(files) => {
+                    cache.insert(link.mod_id, files);
+                }
+                Err(e) => {
+                    result.errors.push(format!("{folder}: {e}"));
+                    continue;
                 }
             }
         }
+        let mut updated = link.clone();
+        apply_assessment(&mut updated, &cache[&link.mod_id], versions.get(folder).map(String::as_str).unwrap_or(""));
+        result.checked += 1;
+        let (id, folder) = (inst.clone(), folder.clone());
+        app.write(|d| {
+            if let Some(l) = d.links.get_mut(&id).and_then(|m| m.get_mut(&folder)) {
+                *l = updated;
+            }
+        })?;
     }
-    result.updates = scan(&app, &i).into_iter().filter(|m| m.update).map(|m| m.title).collect();
+    for m in scan(&app, &i) {
+        match m.nexus.as_ref().and_then(|l| l.status.as_deref()) {
+            Some("update") => result.updates.push(m.title),
+            Some("unknown") => result.unknown.push(m.title),
+            _ => {}
+        }
+    }
     Ok(result)
 }
 

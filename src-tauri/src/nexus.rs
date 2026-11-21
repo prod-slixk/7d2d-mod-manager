@@ -204,7 +204,7 @@ pub fn download_file(
     }
     Ok(Downloaded {
         path,
-        link: NexusLink { mod_id, file_id: Some(file_id), version: info.version.or(info.mod_version), latest: None, title: info.name },
+        link: NexusLink { mod_id, file_id: Some(file_id), version: info.version.or(info.mod_version), title: info.name, ..Default::default() },
     })
 }
 
@@ -387,7 +387,13 @@ pub fn parse_files(data: &Value) -> Vec<NexusFile> {
         "OPTIONAL" => 2,
         _ => 3,
     };
-    let mut files: Vec<NexusFile> = data["modFiles"]
+    let mut files: Vec<NexusFile> = file_list(data).into_iter().filter(|f| ACTIVE.contains(&f.category.as_str())).collect();
+    files.sort_by_key(|f| (rank(&f.category), std::cmp::Reverse(f.date), std::cmp::Reverse(f.id)));
+    files
+}
+
+fn file_list(data: &Value) -> Vec<NexusFile> {
+    data["modFiles"]
         .as_array()
         .map(|list| {
             list.iter()
@@ -400,12 +406,9 @@ pub fn parse_files(data: &Value) -> Vec<NexusFile> {
                     date: number(&f["date"]) as i64,
                     description: text(&f["description"]),
                 })
-                .filter(|f| matches!(f.category.as_str(), "MAIN" | "UPDATE" | "OPTIONAL" | "MISCELLANEOUS"))
                 .collect()
         })
-        .unwrap_or_default();
-    files.sort_by_key(|f| (rank(&f.category), std::cmp::Reverse(f.date), std::cmp::Reverse(f.id)));
-    files
+        .unwrap_or_default()
 }
 
 /// A mod from the page, cleaned before it's saved: it came through the interface, so it isn't trusted.
@@ -444,19 +447,67 @@ pub fn files(mod_id: u64) -> R<Vec<NexusFile>> {
     Ok(parse_files(&graphql(GQL, json!({ "modId": mod_id.to_string(), "gameId": GAME_ID }))?))
 }
 
-#[derive(Deserialize)]
-struct ModInfoResp {
-    version: Option<String>,
-    name: Option<String>,
+/// Every file of a mod, old and archived ones included. Needs no API key.
+pub fn all_files(mod_id: u64) -> R<Vec<NexusFile>> {
+    const GQL: &str = "query F($modId: ID!, $gameId: ID!) {
+        modFiles(modId: $modId, gameId: $gameId) { fileId name version category sizeInBytes date description }
+    }";
+    Ok(file_list(&graphql(GQL, json!({ "modId": mod_id.to_string(), "gameId": GAME_ID }))?))
 }
 
-pub fn latest_version(http: &Client, key: &str, mod_id: u64) -> R<(Option<String>, Option<String>)> {
-    let r: ModInfoResp = api_get(http, key, &format!("/games/{GAME}/mods/{mod_id}.json"))?.json().map_err(|e| e.to_string())?;
-    Ok((r.version, r.name))
+#[derive(Debug, PartialEq)]
+pub struct Assessment {
+    /// "current", "update" or "unknown"
+    pub status: &'static str,
+    pub latest: Option<String>,
+    pub latest_file: Option<u64>,
 }
 
-pub fn http_client() -> R<Client> {
-    client()
+const ACTIVE: [&str; 4] = ["MAIN", "UPDATE", "OPTIONAL", "MISCELLANEOUS"];
+
+/// Decides whether an installed mod is out of date from the Nexus file it was installed from.
+/// Authors often leave the version inside ModInfo.xml unchanged between releases, so that number
+/// is only trusted when the installed file isn't known and it matches the newest file exactly.
+pub fn assess(file_id: Option<u64>, installed_version: &str, files: &[NexusFile]) -> Assessment {
+    fn newest<'a>(list: Vec<&'a NexusFile>) -> Option<&'a NexusFile> {
+        list.into_iter().max_by_key(|f| (f.date, f.id))
+    }
+    let active = |f: &&NexusFile| ACTIVE.contains(&f.category.as_str());
+    let same_name = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
+    let pick = |f: Option<&NexusFile>, status| Assessment {
+        status,
+        latest: f.map(|f| f.version.clone()).filter(|v| !v.is_empty()),
+        latest_file: f.map(|f| f.id),
+    };
+    let main = newest(files.iter().filter(|f| matches!(f.category.as_str(), "MAIN" | "UPDATE")).collect());
+    let installed = file_id.and_then(|id| files.iter().find(|f| f.id == id));
+    match (file_id, installed) {
+        (_, Some(inst)) if active(&inst) => {
+            // Still listed as current; a newer upload under the same name replaces it.
+            let newer = newest(files.iter().filter(active).filter(|f| same_name(&f.name, &inst.name) && (f.date, f.id) > (inst.date, inst.id)).collect());
+            match newer {
+                Some(n) => pick(Some(n), "update"),
+                None => pick(Some(inst), "current"),
+            }
+        }
+        (_, Some(inst)) => {
+            // The author moved it to old versions or the archive.
+            let replacement = newest(files.iter().filter(active).filter(|f| same_name(&f.name, &inst.name)).collect()).or(main);
+            match replacement {
+                Some(r) => pick(Some(r), "update"),
+                None => pick(None, "unknown"),
+            }
+        }
+        // The installed file was deleted from Nexus.
+        (Some(_), None) => match main {
+            Some(m) => pick(Some(m), "update"),
+            None => pick(None, "unknown"),
+        },
+        (None, None) => match main {
+            Some(m) if !m.version.is_empty() && !installed_version.is_empty() && crate::mods::same_version(&m.version, installed_version) => pick(Some(m), "current"),
+            m => pick(m, "unknown"),
+        },
+    }
 }
 
 // ---- nxm:// protocol handler --------------------------------------------
@@ -513,6 +564,52 @@ mod tests {
     fn parses_download_link() {
         let l = parse_nxm("nxm://7daystodie/mods/123/files/456?key=abc&expires=1700000000&user_id=9").unwrap();
         assert_eq!((l.mod_id, l.file_id, l.key.as_str(), l.expires.as_str()), (123, 456, "abc", "1700000000"));
+    }
+
+    fn file(id: u64, name: &str, version: &str, category: &str, date: i64) -> NexusFile {
+        NexusFile { id, name: name.into(), version: version.into(), category: category.into(), size: 0, date, description: String::new() }
+    }
+
+    /// GNS Beautiful Bases as Nexus lists it: ModInfo.xml has said "2.0" since 2023, which also
+    /// matches an old 2025 file, while the current file is 3.7.
+    fn gns() -> Vec<NexusFile> {
+        vec![
+            file(42629, "GNS Beautiful Bases 3.0", "3.7", "MAIN", 1_783_000_000),
+            file(42296, "GNS Beautiful Bases 3.0", "3.6", "OLD_VERSION", 1_782_700_000),
+            file(28060, "GNS Beautiful Bases Mod for 2.0", "2.0", "OLD_VERSION", 1_750_000_000),
+            file(12398, "GNS Beautiful Bases 2", "2.0", "ARCHIVED", 1_689_000_000),
+        ]
+    }
+
+    #[test]
+    fn installed_current_file_is_up_to_date_whatever_modinfo_says() {
+        let a = assess(Some(42629), "2.0", &gns());
+        assert_eq!((a.status, a.latest.as_deref()), ("current", Some("3.7")));
+    }
+
+    #[test]
+    fn installed_old_file_points_to_the_current_one() {
+        assert_eq!(assess(Some(42296), "3.6", &gns()), Assessment { status: "update", latest: Some("3.7".into()), latest_file: Some(42629) });
+        // A renamed release still counts as the replacement.
+        assert_eq!(assess(Some(28060), "2.0", &gns()).latest_file, Some(42629));
+        // So does the newest main file when the installed one was deleted.
+        assert_eq!(assess(Some(99), "1.0", &gns()).status, "update");
+    }
+
+    #[test]
+    fn unknown_file_is_never_reported_as_an_update() {
+        assert_eq!(assess(None, "2.0", &gns()).status, "unknown");
+        assert_eq!(assess(None, "", &gns()).status, "unknown");
+        // A version that matches the newest file exactly is enough to call it current.
+        assert_eq!(assess(None, "3.7.0", &gns()).status, "current");
+    }
+
+    #[test]
+    fn newer_upload_with_the_same_name_is_an_update() {
+        let files = vec![file(1, "SMX", "3.4.10", "MAIN", 100), file(2, "SMX", "3.4.11", "MAIN", 200), file(3, "SMX addon", "9", "OPTIONAL", 300)];
+        assert_eq!(assess(Some(1), "3.4.10", &files).latest_file, Some(2));
+        assert_eq!(assess(Some(2), "3.4.11", &files).status, "current");
+        assert_eq!(assess(Some(3), "9", &files).status, "current");
     }
 
     #[test]

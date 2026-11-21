@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::install::{self, Manifest, Staging};
 use crate::mods::{self, ModEntry};
-use crate::store::{App, Instance, ModRef, Profile};
+use crate::store::{App, Instance, ModRef, NexusLink, Profile};
 use crate::util::{extract_zip, io_msg, zip_add_bytes, zip_add_dir, zip_create, R};
 
 pub fn snapshot(mods: &[ModEntry]) -> Vec<ModRef> {
@@ -75,6 +75,9 @@ struct PackMod {
     name: String,
     version: String,
     nexus_id: Option<u64>,
+    /// The Nexus file the mod was installed from, so update checks work after import.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_id: Option<u64>,
 }
 
 pub fn export(profile: &Profile, mods: &[ModEntry], dest: &Path, with_files: bool, progress: &dyn Fn(&str)) -> R<()> {
@@ -82,7 +85,15 @@ pub fn export(profile: &Profile, mods: &[ModEntry], dest: &Path, with_files: boo
         format: 1,
         name: profile.name.clone(),
         created: chrono::Utc::now().timestamp(),
-        mods: profile.mods.iter().map(|m| PackMod { folder: m.folder.clone(), name: m.name.clone(), version: m.version.clone(), nexus_id: m.nexus_id }).collect(),
+        mods: profile
+            .mods
+            .iter()
+            .map(|m| {
+                let link = mods.iter().find(|e| e.folder.eq_ignore_ascii_case(&m.folder)).and_then(|e| e.nexus.as_ref());
+                let file_id = link.filter(|l| Some(l.mod_id) == m.nexus_id).and_then(|l| l.file_id);
+                PackMod { folder: m.folder.clone(), name: m.name.clone(), version: m.version.clone(), nexus_id: m.nexus_id, file_id }
+            })
+            .collect(),
     };
     let tmp = dest.with_extension("partial");
     let build = || -> R<()> {
@@ -125,8 +136,13 @@ pub fn import(app: &App, existing: &[ModEntry], path: &Path, progress: &dyn Fn(&
             let mut found = Vec::new();
             install::find_mod_dirs(&child.path(), &mut found);
             for m in found {
-                let nexus_id = pack.mods.iter().find(|p| p.folder.eq_ignore_ascii_case(&m.file_name().unwrap_or_default().to_string_lossy())).and_then(|p| p.nexus_id);
-                candidates.push(install::candidate_from(&m, &mods_dir, &origin, "Mod", existing, nexus_id));
+                let entry = pack.mods.iter().find(|p| p.folder.eq_ignore_ascii_case(&m.file_name().unwrap_or_default().to_string_lossy()));
+                let nexus_id = entry.and_then(|p| p.nexus_id);
+                let mut c = install::candidate_from(&m, &mods_dir, &origin, "Mod", existing, nexus_id);
+                if let (Some(mod_id), Some(file_id)) = (nexus_id, entry.and_then(|p| p.file_id)) {
+                    c.nexus = Some(NexusLink { mod_id, file_id: Some(file_id), ..Default::default() });
+                }
+                candidates.push(c);
             }
         }
         install::dedupe(&mut candidates);

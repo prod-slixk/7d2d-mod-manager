@@ -61,8 +61,11 @@ pub fn find_mod_dirs(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// Reads the Nexus mod id from names like `Cool Mod-1234-1-0-1700000000.zip`.
 pub fn nexus_id_from_filename(name: &str) -> Option<u64> {
-    let re = Regex::new(r"-(\d+)-[\dv._-]*?-?\d{9,}\.[A-Za-z0-9]+$").unwrap();
-    re.captures(name).and_then(|c| c[1].parse().ok())
+    // Older Nexus names: "Cool Mod-1234-1-0-1700000000.zip"
+    let old = Regex::new(r"-(\d+)-[\dv._-]*?-?\d{9,}\.[A-Za-z0-9]+$").unwrap();
+    // Current names: "Drone Weapons Redux 10788 3.4.0 2026-11-09T19-08Z Uk4MbEqcj.zip"
+    let new = Regex::new(r" (\d+) (?:\S+ )?\d{4}-\d{2}-\d{2}T\d{2}-\d{2}Z [A-Za-z0-9]+\.[A-Za-z0-9]+$").unwrap();
+    old.captures(name).or_else(|| new.captures(name)).and_then(|c| c[1].parse().ok())
 }
 
 pub fn candidate_from(dir: &Path, unpack_root: &Path, origin: &str, stem: &str, existing: &[ModEntry], nexus_id: Option<u64>) -> Candidate {
@@ -199,8 +202,9 @@ pub fn commit(app: &App, inst: &Instance, staging: &Staging, selected: &[String]
                         mod_id,
                         file_id: from_nexus.as_ref().and_then(|n| n.file_id),
                         version: from_nexus.as_ref().and_then(|n| n.version.clone()).or_else(|| Some(c.version.clone())),
-                        latest: from_nexus.as_ref().and_then(|n| n.latest.clone()),
                         title: from_nexus.and_then(|n| n.title),
+                        // The new copy hasn't been checked yet, so the old result doesn't carry over.
+                        ..Default::default()
                     };
                     let (inst_id, folder) = (inst.id.clone(), c.folder.clone());
                     app.write(|d| {
@@ -235,6 +239,11 @@ mod tests {
         assert_eq!(nexus_id_from_filename("Cool Mod-1234-1-0-1700000000.zip"), Some(1234));
         assert_eq!(nexus_id_from_filename("Cool-77-v2-1-1700000000.7z"), Some(77));
         assert_eq!(nexus_id_from_filename("MyMod.zip"), None);
+        // Nexus's current naming, from real downloads.
+        assert_eq!(nexus_id_from_filename("Drone Weapons Redux 10788 3.4.0 2026-11-09T19-08Z Uk4MbEqcj.zip"), Some(10788));
+        assert_eq!(nexus_id_from_filename("Flogis Quest Mod Version 1.3.3 6688 1.3.3 2026-10-15T16-03Z Q8rTW97VF.zip"), Some(6688));
+        assert_eq!(nexus_id_from_filename("DSD Arsenal V1.2.1 13921 1.2.1 2026-11-11T21-55Z EjnRsi6Dj.zip"), Some(13921));
+        assert_eq!(nexus_id_from_filename("Season 2 Pack 2026-11-09.zip"), None);
         assert_eq!(nexus_id_from_filename("Mod-v1-2.zip"), None);
     }
 }

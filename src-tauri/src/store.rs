@@ -25,6 +25,13 @@ pub struct NexusLink {
     pub version: Option<String>,
     pub latest: Option<String>,
     pub title: Option<String>,
+    /// Result of the last update check: "current", "update" or "unknown" (which Nexus file is
+    /// installed can't be told). None until checked.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// The Nexus file the last check suggests installing.
+    #[serde(default)]
+    pub latest_file: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

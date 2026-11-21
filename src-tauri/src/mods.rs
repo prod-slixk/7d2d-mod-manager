@@ -139,6 +139,11 @@ pub fn version_newer(latest: &str, current: &str) -> bool {
     false
 }
 
+/// "1.0" and "1.0.0" are the same version.
+pub fn same_version(a: &str, b: &str) -> bool {
+    !version_newer(a, b) && !version_newer(b, a)
+}
+
 fn nested_mod(dir: &Path) -> Option<String> {
     fs::read_dir(dir).ok()?.flatten().find_map(|e| {
         let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
@@ -167,10 +172,8 @@ fn read_entry(root: &str, enabled: bool, path: &Path, links: &HashMap<String, Ne
     let modified = fs::metadata(path).map(|m| modified_secs(&m)).unwrap_or(0);
     let title = [&info.display_name, &info.name, &folder].iter().find(|s| !s.is_empty()).map(|s| s.to_string()).unwrap();
     let nexus = links.get(&folder).cloned();
-    let update = nexus.as_ref().is_some_and(|l| match &l.latest {
-        Some(latest) => version_newer(latest, l.version.as_deref().unwrap_or(&info.version)),
-        None => false,
-    });
+    // Set by the update check, which works from the installed Nexus file, not ModInfo's version.
+    let update = nexus.as_ref().is_some_and(|l| l.status.as_deref() == Some("update"));
     ModEntry {
         id: format!("{root}:{}:{folder}", if enabled { "on" } else { "off" }),
         root: root.to_string(),

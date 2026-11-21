@@ -41,7 +41,7 @@ fn sim() -> Sim {
 }
 
 fn scan(s: &Sim) -> Vec<mods::ModEntry> {
-    mods::scan(&s.inst, &Default::default())
+    mods::scan(&s.inst, &s.app.links_for(&s.inst.id))
 }
 
 fn by_folder<'a>(list: &'a [mods::ModEntry], f: &str) -> &'a mods::ModEntry {
@@ -117,7 +117,7 @@ fn queued_downloads_install_together_and_each_keeps_its_nexus_link() {
     let (a, b) = (src.join("a.zip"), src.join("b.zip"));
     make_zip(&a, &[("Echo/ModInfo.xml", &modinfo("Echo", "1.0"))]);
     make_zip(&b, &[("Foxtrot/ModInfo.xml", &modinfo("Foxtrot", "2.0"))]);
-    let link = |mod_id, file_id, v: &str| crate::store::NexusLink { mod_id, file_id: Some(file_id), version: Some(v.into()), latest: None, title: None };
+    let link = |mod_id, file_id, v: &str| crate::store::NexusLink { mod_id, file_id: Some(file_id), version: Some(v.into()), ..Default::default() };
     let sources = vec![(a.to_string_lossy().to_string(), Some(link(11, 110, "1.0"))), (b.to_string_lossy().to_string(), Some(link(22, 220, "2.0")))];
 
     let staged = install::prepare_sources(&s.app, &scan(&s), &sources, &|_| {}).unwrap();
@@ -319,6 +319,12 @@ fn failed_profile_apply_undoes_earlier_moves() {
 #[test]
 fn modpack_round_trip_with_files() {
     let s = sim();
+    s.app
+        .write(|d| {
+            let link = crate::store::NexusLink { mod_id: 7, file_id: Some(70), version: Some("1.0".into()), status: Some("update".into()), ..Default::default() };
+            d.links.entry(s.inst.id.clone()).or_default().insert("Alpha".into(), link);
+        })
+        .unwrap();
     let list = scan(&s);
     let p = profiles::new_profile("Pack", profiles::snapshot(&list));
     assert_eq!(p.mods.len(), 2, "core mods stay out of profiles");
@@ -332,7 +338,10 @@ fn modpack_round_trip_with_files() {
     assert_eq!(staged.candidates.len(), 2);
     let ids: Vec<String> = staged.candidates.iter().map(|c| c.id.clone()).collect();
     install::commit(&other.app, &other.inst, &staged, &ids).unwrap();
-    assert!(scan(&other).iter().any(|m| m.folder == "Alpha"));
+    let alpha = scan(&other).into_iter().find(|m| m.folder == "Alpha").expect("Alpha installed");
+    let link = alpha.nexus.expect("Alpha keeps its Nexus link");
+    assert_eq!((link.mod_id, link.file_id), (7, Some(70)), "the Nexus file travels with the modpack");
+    assert!(!alpha.update, "the old check result doesn't carry over to the new copy");
 }
 
 #[test]

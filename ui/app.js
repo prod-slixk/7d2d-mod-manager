@@ -631,7 +631,9 @@ async function checkUpdates() {
     const r = await withBusy("Checking Nexus for updates", () => call("nexus_check_updates"));
     if (!r.checked && !r.errors.length) toast("No mods are linked to Nexus yet.", "warn");
     else if (r.updates.length) toast(`Updates available: ${r.updates.join(", ")}`);
-    else toast(`All ${plural(r.checked, "linked mod")} up to date`);
+    else if (!r.unknown.length) toast(`All ${plural(r.checked, "linked mod")} up to date`);
+    else toast("No updates found");
+    if (r.unknown.length) toast(`Can't tell which Nexus file is installed for ${plural(r.unknown.length, "mod")}. Select one for details.`, "warn");
     r.errors.slice(0, 3).forEach((x) => toast(x, "error"));
     await afterChange();
   } catch (e) {
@@ -672,8 +674,11 @@ function renderDetail() {
     h("div", { class: "detail-title" }, m.title),
     h("div", { class: "badges" }, h("span", { class: `badge ${m.enabled ? "green" : ""}` }, m.enabled ? "Enabled" : "Disabled"), modBadges(m)),
     problem,
-    m.update && h("div", { class: "callout medium" }, h("b", {}, `Version ${m.nexus.latest} is out`), "Open the Nexus page and use Mod Manager Download to update.",
-      h("div", {}, btn("Open Nexus page", () => call("open_url", { url: nexusUrl(m.nexus.mod_id) }).catch(fail), { small: true, icon: "link" }))),
+    m.update && h("div", { class: "callout medium" }, h("b", {}, m.nexus.latest ? `Version ${m.nexus.latest} is out` : "A newer file is out"),
+      "Nexus has replaced the file this mod was installed from. Download the new one from Browse Nexus or the Nexus page.",
+      h("div", {}, btn("Open Nexus page", () => call("open_url", { url: m.nexus.latest_file ? nexusFileUrl(m.nexus.mod_id, m.nexus.latest_file) : nexusUrl(m.nexus.mod_id) }).catch(fail), { small: true, icon: "link" }))),
+    m.nexus?.status === "unknown" && h("div", { class: "callout low" }, h("b", {}, "Update status unknown"),
+      `This mod wasn't installed from Nexus here, so the manager can't tell which Nexus file it is. Its own version number${m.version ? ` (${m.version})` : ""} isn't reliable, because authors often don't change it. ${m.nexus.latest ? `The newest file on Nexus is ${m.nexus.latest}. ` : ""}Install that file once from Browse Nexus and updates will be tracked from then on.`),
     m.legacy && h("div", { class: "callout low" }, "This mod uses the old ModInfo layout, so it was likely built for an older game version."),
     m.malformed && h("div", { class: "callout high" }, "ModInfo.xml has broken XML. The game may refuse to load this mod."),
     m.description && h("p", { class: "desc" }, m.description),
