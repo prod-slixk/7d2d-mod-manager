@@ -1,6 +1,6 @@
 [package]
 name = "mod-manager-7d2d"
-version = "1.3.1"
+version = "1.3.2"
 description = "Mod manager for 7 Days to Die"
 edition = "2021"
 

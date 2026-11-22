@@ -1,6 +1,6 @@
 //! Finds mods whose XML patches or identities collide.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -47,6 +47,8 @@ pub struct Edit {
     /// For csv edits: "add" or "remove", and the separator between entries.
     pub list_op: String,
     pub delim: String,
+    /// Inside a condition that depends on a setting, so it may not apply.
+    pub maybe: bool,
 }
 
 /// Normalizes spacing and quote style so equal xpaths compare equal.
@@ -88,11 +90,214 @@ fn step_ends(xpath: &str) -> Vec<usize> {
 
 const OPS: [&str; 8] = ["set", "append", "insertafter", "insertbefore", "remove", "setattribute", "removeattribute", "csv"];
 
-fn collect(node: roxmltree::Node, mod_idx: usize, file: &str, out: &mut Vec<Edit>) {
+/// Result of a patch condition when only the set of loaded mods is known.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Tri {
+    Yes,
+    No,
+    /// Depends on something unknown here, such as a Gears setting.
+    Maybe,
+}
+
+/// Evaluates a `cond` attribute such as `mod_loaded('A') and not mod_loaded('B')`.
+/// `mod_loaded` is answered from `loaded` (lowercase ModInfo names); anything else is Maybe.
+pub fn eval_cond(cond: &str, loaded: &HashSet<String>) -> Tri {
+    let tokens = tokenize(cond);
+    let mut p = CondParser { t: &tokens, i: 0, loaded };
+    match p.or() {
+        Some(v) if p.i == tokens.len() => v,
+        _ => Tri::Maybe,
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum Tok {
+    Word(String),
+    Str(String),
+    Sym(&'static str),
+}
+
+fn tokenize(s: &str) -> Vec<Tok> {
+    let (mut out, chars): (Vec<Tok>, Vec<char>) = (Vec::new(), s.chars().collect());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+        } else if c == '\'' || c == '"' {
+            let end = chars[i + 1..].iter().position(|&x| x == c).map(|p| i + 1 + p).unwrap_or(chars.len());
+            out.push(Tok::Str(chars[i + 1..end.min(chars.len())].iter().collect()));
+            i = end + 1;
+        } else if chars[i..].starts_with(&['=', '=']) || chars[i..].starts_with(&['!', '=']) {
+            out.push(Tok::Sym(if c == '=' { "==" } else { "!=" }));
+            i += 2;
+        } else if "(),".contains(c) {
+            out.push(Tok::Sym(match c { '(' => "(", ')' => ")", _ => "," }));
+            i += 1;
+        } else {
+            let start = i;
+            while i < chars.len() && !chars[i].is_whitespace() && !"(),'\"=!".contains(chars[i]) {
+                i += 1;
+            }
+            if i == start {
+                // A lone '=' or '!' that isn't part of an operator: unreadable, so give up.
+                return vec![Tok::Sym("?")];
+            }
+            out.push(Tok::Word(chars[start..i].iter().collect()));
+        }
+    }
+    out
+}
+
+struct CondParser<'a> {
+    t: &'a [Tok],
+    i: usize,
+    loaded: &'a HashSet<String>,
+}
+
+impl CondParser<'_> {
+    fn word(&self, w: &str) -> bool {
+        matches!(self.t.get(self.i), Some(Tok::Word(x)) if x.eq_ignore_ascii_case(w))
+    }
+    fn sym(&self, s: &str) -> bool {
+        matches!(self.t.get(self.i), Some(Tok::Sym(x)) if *x == s)
+    }
+    fn or(&mut self) -> Option<Tri> {
+        let mut v = self.and()?;
+        while self.word("or") {
+            self.i += 1;
+            let r = self.and()?;
+            v = match (v, r) {
+                (Tri::Yes, _) | (_, Tri::Yes) => Tri::Yes,
+                (Tri::No, Tri::No) => Tri::No,
+                _ => Tri::Maybe,
+            };
+        }
+        Some(v)
+    }
+    fn and(&mut self) -> Option<Tri> {
+        let mut v = self.unary()?;
+        while self.word("and") {
+            self.i += 1;
+            let r = self.unary()?;
+            v = match (v, r) {
+                (Tri::No, _) | (_, Tri::No) => Tri::No,
+                (Tri::Yes, Tri::Yes) => Tri::Yes,
+                _ => Tri::Maybe,
+            };
+        }
+        Some(v)
+    }
+    fn unary(&mut self) -> Option<Tri> {
+        if self.word("not") {
+            self.i += 1;
+            return Some(match self.unary()? {
+                Tri::Yes => Tri::No,
+                Tri::No => Tri::Yes,
+                Tri::Maybe => Tri::Maybe,
+            });
+        }
+        self.primary()
+    }
+    fn primary(&mut self) -> Option<Tri> {
+        if self.sym("(") {
+            self.i += 1;
+            let v = self.or()?;
+            if !self.sym(")") {
+                return None;
+            }
+            self.i += 1;
+            return Some(v);
+        }
+        let v = match self.t.get(self.i)? {
+            Tok::Word(name) if matches!(self.t.get(self.i + 1), Some(Tok::Sym("("))) => {
+                let name = name.to_ascii_lowercase();
+                self.i += 2;
+                let mut args = Vec::new();
+                while !self.sym(")") {
+                    match self.t.get(self.i)? {
+                        Tok::Str(s) | Tok::Word(s) => args.push(s.clone()),
+                        Tok::Sym(",") => {}
+                        Tok::Sym(_) => return None,
+                    }
+                    self.i += 1;
+                }
+                self.i += 1;
+                match (name.as_str(), args.as_slice()) {
+                    ("mod_loaded", [m]) => if self.loaded.contains(&m.to_lowercase()) { Tri::Yes } else { Tri::No },
+                    _ => Tri::Maybe,
+                }
+            }
+            Tok::Word(_) | Tok::Str(_) => {
+                self.i += 1;
+                Tri::Maybe
+            }
+            Tok::Sym(_) => return None,
+        };
+        // Comparisons such as modsetting(...) == 'Vanilla' depend on values not known here.
+        if self.sym("==") || self.sym("!=") {
+            self.i += 1;
+            self.primary()?;
+            return Some(Tri::Maybe);
+        }
+        Some(v)
+    }
+}
+
+/// What `collect` needs to follow conditions and `<include>` files.
+pub struct Scope<'a> {
+    pub loaded: &'a HashSet<String>,
+    pub dir: &'a Path,
+    pub depth: usize,
+    /// Under a branch whose condition depends on a setting.
+    pub maybe: bool,
+}
+
+fn collect(node: roxmltree::Node, mod_idx: usize, file: &str, scope: &Scope, out: &mut Vec<Edit>) {
     for child in node.children().filter(|n| n.is_element()) {
         let tag = child.tag_name().name().to_ascii_lowercase();
-        if ["conditional", "if", "else"].contains(&tag.as_str()) {
-            collect(child, mod_idx, file, out);
+        if tag == "conditional" {
+            // The game applies the first branch whose condition holds, else the <else>.
+            let mut settled = false;
+            for branch in child.children().filter(|n| n.is_element()) {
+                if settled {
+                    break;
+                }
+                let maybe = match branch.tag_name().name().to_ascii_lowercase().as_str() {
+                    "if" => match eval_cond(branch.attribute("cond").unwrap_or(""), scope.loaded) {
+                        Tri::Yes => {
+                            settled = true;
+                            false
+                        }
+                        Tri::No => continue,
+                        Tri::Maybe => true,
+                    },
+                    "else" => {
+                        settled = true;
+                        false
+                    }
+                    _ => continue,
+                };
+                let inner = Scope { maybe: scope.maybe || maybe, ..*scope };
+                collect(branch, mod_idx, file, &inner, out);
+            }
+            continue;
+        }
+        if tag == "if" || tag == "else" {
+            collect(child, mod_idx, file, &Scope { maybe: true, ..*scope }, out);
+            continue;
+        }
+        if tag == "include" {
+            // Included patches act on the including file, the same way the game reads them.
+            let Some(target) = child.attribute("filename").map(|f| scope.dir.join(f)) else { continue };
+            if scope.depth >= 8 {
+                continue;
+            }
+            let text = fs::read(&target).map(|b| String::from_utf8_lossy(&b).to_string()).unwrap_or_default();
+            if let Ok(doc) = roxmltree::Document::parse(text.trim_start_matches('\u{feff}').trim_start()) {
+                let dir = target.parent().unwrap_or(scope.dir);
+                collect(doc.root_element(), mod_idx, file, &Scope { dir, depth: scope.depth + 1, ..*scope }, out);
+            }
             continue;
         }
         let (true, Some(xpath)) = (OPS.contains(&tag.as_str()), child.attribute("xpath")) else { continue };
@@ -106,32 +311,64 @@ fn collect(node: roxmltree::Node, mod_idx: usize, file: &str, out: &mut Vec<Edit
         let value = child.text().unwrap_or("").trim().to_string();
         let list_op = child.attribute("op").unwrap_or("add").trim().to_ascii_lowercase();
         let delim = child.attribute("delim").filter(|d| !d.is_empty()).unwrap_or(",").to_string();
-        out.push(Edit { mod_idx, file: file.to_string(), xpath, op: tag, value, list_op, delim });
+        out.push(Edit { mod_idx, file: file.to_string(), xpath, op: tag, value, list_op, delim, maybe: scope.maybe });
     }
 }
 
 /// Parses every XML patch under a mod's Config folder. Returns unparseable files too.
-pub fn parse_mod_config(mod_dir: &Path, mod_idx: usize) -> (Vec<Edit>, Vec<String>) {
+/// `loaded` holds the lowercase ModInfo names of every enabled mod, for `mod_loaded()` conditions.
+pub fn parse_mod_config(mod_dir: &Path, mod_idx: usize, loaded: &HashSet<String>) -> (Vec<Edit>, Vec<String>) {
     let (mut edits, mut bad) = (Vec::new(), Vec::new());
     let Some(config) = fs::read_dir(mod_dir).ok().and_then(|rd| {
         rd.flatten().find(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case("config")).map(|e| e.path())
     }) else {
         return (edits, bad);
     };
-    for entry in WalkDir::new(&config).into_iter().flatten() {
-        let is_xml = entry.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("xml"));
-        if !entry.file_type().is_file() || !is_xml {
+    let files: Vec<(std::path::PathBuf, String)> = WalkDir::new(&config)
+        .into_iter()
+        .flatten()
+        .filter(|e| e.file_type().is_file() && e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("xml")))
+        .map(|e| (e.path().to_path_buf(), String::from_utf8_lossy(&fs::read(e.path()).unwrap_or_default()).to_string()))
+        .collect();
+    // Files pulled in through <include> are read as part of the file that includes them.
+    let include = regex::Regex::new(r#"<include\s+filename\s*=\s*"([^"]+)""#).unwrap();
+    let key = |p: &Path| p.to_string_lossy().replace('\\', "/").to_lowercase();
+    let mut included: HashSet<String> = HashSet::new();
+    for (path, text) in &files {
+        let dir = path.parent().unwrap_or(&config);
+        for c in include.captures_iter(text) {
+            included.insert(key(&normalize_path(&dir.join(&c[1]))));
+        }
+    }
+    for (path, text) in &files {
+        if included.contains(&key(path)) {
             continue;
         }
-        let rel = entry.path().strip_prefix(&config).unwrap_or(entry.path()).to_string_lossy().replace('\\', "/").to_lowercase();
-        let bytes = fs::read(entry.path()).unwrap_or_default();
-        let text = String::from_utf8_lossy(&bytes);
+        let rel = path.strip_prefix(&config).unwrap_or(path).to_string_lossy().replace('\\', "/").to_lowercase();
         match roxmltree::Document::parse(text.trim_start_matches('\u{feff}').trim_start()) {
-            Ok(doc) => collect(doc.root_element(), mod_idx, &rel, &mut edits),
+            Ok(doc) => {
+                let scope = Scope { loaded, dir: path.parent().unwrap_or(&config), depth: 0, maybe: false };
+                collect(doc.root_element(), mod_idx, &rel, &scope, &mut edits);
+            }
             Err(_) => bad.push(rel),
         }
     }
     (edits, bad)
+}
+
+/// Resolves `..` and `.` without touching the disk.
+fn normalize_path(p: &Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 fn part(m: &ModEntry, e: &Edit) -> Part {
@@ -182,7 +419,8 @@ pub fn compare(mods: &[ModEntry], edits: &[Edit]) -> Vec<Issue> {
         }
         let winner = mods[*owners.last().unwrap()].title.clone();
         let (severity, kind, title, detail) = if removes {
-            ("high", "remove", "One mod removes what another changes", format!("Whichever runs later may fail. {winner} loads last."))
+            let maybe = if writers.iter().any(|e| e.maybe) { " Part of this depends on a mod setting, so it may not happen in your game." } else { "" };
+            ("high", "remove", "One mod removes what another changes", format!("Whichever runs later may fail. {winner} loads last.{maybe}"))
         } else if csv {
             let detail = if list_clash.is_empty() {
                 "Results depend on load order. Check that the combination does what you expect.".to_string()
@@ -221,11 +459,32 @@ pub fn compare(mods: &[ModEntry], edits: &[Edit]) -> Vec<Issue> {
         }
         let mut parts = vec![part(&mods[rem.mod_idx], rem)];
         parts.extend(others.iter().map(|e| part(&mods[e.mod_idx], e)));
+        // Mods that load before the remover lose their edits outright. Mods that load after it
+        // edit whatever replaced the node, which only works if the new version is built the same way.
+        let names = |list: Vec<usize>| {
+            let mut list = list;
+            list.sort_unstable();
+            list.dedup();
+            list.iter().map(|i| mods[*i].title.clone()).collect::<Vec<_>>().join(", ")
+        };
+        let before = names(others.iter().filter(|e| e.mod_idx < rem.mod_idx).map(|e| e.mod_idx).collect());
+        let after = names(others.iter().filter(|e| e.mod_idx > rem.mod_idx).map(|e| e.mod_idx).collect());
+        let remover = &mods[rem.mod_idx].title;
+        let mut detail = format!("{remover} removes this node.");
+        if !before.is_empty() {
+            detail.push_str(&format!(" {before} loads earlier, so its changes here are wiped out."));
+        }
+        if !after.is_empty() {
+            detail.push_str(&format!(" {after} loads later and edits {remover}'s version, which only works if it's built the same way."));
+        }
+        if rem.maybe {
+            detail.push_str(&format!(" This depends on a mod setting (for example in Gears), so it may not happen in your game."));
+        }
         issues.push(Issue {
-            severity: "high".into(),
+            severity: if rem.maybe { "medium" } else { "high" }.into(),
             kind: "remove-parent".into(),
             title: "One mod removes something another edits inside".into(),
-            detail: format!("{} removes this node, so edits to anything inside it can fail.", mods[rem.mod_idx].title),
+            detail,
             file: Some(rem.file.clone()),
             xpath: Some(rem.xpath.clone()),
             parts,
@@ -249,9 +508,10 @@ pub fn analyze(mods: &[ModEntry]) -> Report {
 
     let mut edits = Vec::new();
     let mut issues = Vec::new();
+    let loaded: HashSet<String> = enabled.iter().map(|m| m.name.to_lowercase()).collect();
 
     for (i, m) in enabled.iter().enumerate() {
-        let (found, bad) = parse_mod_config(Path::new(&m.path), i);
+        let (found, bad) = parse_mod_config(Path::new(&m.path), i, &loaded);
         edits.extend(found);
         for file in bad {
             issues.push(simple(
@@ -357,6 +617,76 @@ mod tests {
     fn ignores_slashes_inside_predicates() {
         let p = "/items/item[@name='a/b']/property";
         assert_eq!(step_ends(p).iter().map(|e| &p[..*e]).collect::<Vec<_>>(), vec!["/items", "/items/item[@name='a/b']"]);
+    }
+
+    #[test]
+    fn evaluates_patch_conditions_from_loaded_mods() {
+        let loaded: HashSet<String> = ["zsmxhud", "quartz"].iter().map(|s| s.to_string()).collect();
+        let e = |c: &str| eval_cond(c, &loaded);
+        assert_eq!(e("mod_loaded('Quartz')"), Tri::Yes, "names compare case-insensitively");
+        assert_eq!(e("mod_loaded('SMX26LegacyUi')"), Tri::No);
+        assert_eq!(e("not mod_loaded('SMX26LegacyUi')"), Tri::Yes);
+        assert_eq!(e("mod_loaded('Quartz') and not mod_loaded(\"Gears\")"), Tri::Yes);
+        assert_eq!(e("mod_loaded('A') or mod_loaded('B')"), Tri::No);
+        // SMX's real conditions: without Gears the setting can't apply, so the branch is certain.
+        let smx = "not mod_loaded('Gears') or modsetting('zSMXui', 'global', 'Windows.Inventory.Inventory') != 'Vanilla'";
+        assert_eq!(e(smx), Tri::Yes);
+        let with_gears: HashSet<String> = ["gears".to_string()].into_iter().collect();
+        assert_eq!(eval_cond(smx, &with_gears), Tri::Maybe, "with Gears it depends on the setting");
+        assert_eq!(e("mod_loaded('zSMXhud') and (not mod_loaded('Gears') or modsetting('SMXcore', 'global', 'X') == 'True')"), Tri::Yes);
+        assert_eq!(e("mod_loaded('Nope') and modsetting('a', 'b', 'c') == 'x'"), Tri::No, "a false side settles an and");
+        assert_eq!(e("gamepref('x') == 1"), Tri::Maybe);
+        assert_eq!(e("((("), Tri::Maybe, "unreadable conditions are treated as unknown");
+        assert_eq!(e(""), Tri::Maybe);
+    }
+
+    fn write(root: &Path, folder: &str, rel: &str, xml: &str) {
+        let file = root.join(folder).join("Config").join(rel);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, xml).unwrap();
+    }
+
+    #[test]
+    fn branches_for_mods_that_are_not_installed_are_ignored() {
+        let t = tempfile::tempdir().unwrap();
+        let a = make(t.path(), "A", 0, r#"<configs><set xpath="/items/item[@name='gun']/property[@name='x']/@value">1</set></configs>"#);
+        let b = make(
+            t.path(),
+            "B",
+            1,
+            r#"<configs><conditional><if cond="mod_loaded('Legacy')"><remove xpath="/items/item[@name='gun']"/></if></conditional></configs>"#,
+        );
+        assert!(analyze(&[a.clone(), b.clone()]).issues.is_empty(), "the remove only runs with Legacy installed");
+        let legacy = make(t.path(), "Legacy", 2, "<configs/>");
+        let r = analyze(&[a, b, legacy]);
+        assert_eq!(r.issues.len(), 1);
+        assert_eq!(r.issues[0].kind, "remove-parent");
+        assert!(r.issues[0].detail.contains("A loads earlier"), "{}", r.issues[0].detail);
+    }
+
+    #[test]
+    fn included_files_count_as_part_of_the_file_that_includes_them() {
+        let t = tempfile::tempdir().unwrap();
+        // Like SMXcore: windows.xml pulls the real change in from a sub-folder, behind a setting.
+        write(t.path(), "Core", "XUi_InGame/windows.xml", r#"<windows><conditional><if cond="not mod_loaded('Gears') or modsetting('Core', 'global', 'Look') != 'Vanilla'"><include filename="sub/inv.xml"/></if></conditional></windows>"#);
+        write(t.path(), "Core", "XUi_InGame/sub/inv.xml", r#"<windows><remove xpath="/windows/window[@name='backpack']"/></windows>"#);
+        // A compatibility file that is only included for a mod that isn't installed.
+        write(t.path(), "Core", "XUi_InGame/windows_extra.xml", r#"<windows><conditional><if cond="mod_loaded('MapMod')"><include filename="compat/map.xml"/></if></conditional></windows>"#);
+        write(t.path(), "Core", "XUi_InGame/compat/map.xml", r#"<windows><remove xpath="/windows/window[@name='map']"/></windows>"#);
+        write(t.path(), "Before", "XUi_InGame/windows.xml", r#"<windows><append xpath="/windows/window[@name='backpack']/rect"><button name="b"/></append><set xpath="/windows/window[@name='map']/@pos">1</set></windows>"#);
+        let before = entry(&t.path().join("Before"), "Before", 0);
+        let core = entry(&t.path().join("Core"), "Core", 1);
+
+        let r = analyze(&[before.clone(), core.clone()]);
+        assert_eq!(r.issues.len(), 1, "only the backpack: the map compat file isn't active; {:?}", r.issues.iter().map(|i| &i.xpath).collect::<Vec<_>>());
+        let i = &r.issues[0];
+        assert_eq!(i.file.as_deref(), Some("xui_ingame/windows.xml"), "included edits act on the including file");
+        assert_eq!(i.severity, "high", "without Gears the setting can't keep the vanilla window");
+
+        let gears = make(t.path(), "Gears", 2, "<configs/>");
+        let r = analyze(&[before, core, gears]);
+        assert_eq!(r.issues[0].severity, "medium");
+        assert!(r.issues[0].detail.contains("depends on a mod setting"), "{}", r.issues[0].detail);
     }
 
     #[test]
